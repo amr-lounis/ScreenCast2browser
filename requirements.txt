@@ -1,0 +1,7 @@
+dxcam==0.3.0
+opencv-python>=4.8
+Flask>=3.0
+Werkzeug>=3.0
+pywin32>=300
+numpy
+comtypes
