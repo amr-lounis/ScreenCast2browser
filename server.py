@@ -28,26 +28,44 @@ const code=new URLSearchParams(location.search).get('code')||'';
 const img=document.getElementById('s');
 function vurl(){return '/video'+(code?'?code='+encodeURIComponent(code):'')}
 function purl(){return '/ping'+(code?'?code='+encodeURIComponent(code):'')}
-let wasDown=false;
+let wasDown=false,failCount=0,lastLoad=Date.now();
 function connect(){
-  wasDown=false;
-  try{img.src='';}catch(e){}
-  try{img.removeAttribute('src');}catch(e){}
-  void img.offsetWidth;
-  setTimeout(()=>{img.src=vurl()+(vurl().includes('?')?'&':'?')+'t='+Date.now()},80);
+  const u=vurl()+(vurl().includes('?')?'&':'?')+'t='+Date.now();
+  console.log('[connect]',new Date().toLocaleTimeString(),u);
+  lastLoad=Date.now();
+  img.src=u;
 }
-img.onerror=()=>{wasDown=true;setTimeout(connect,600)};
+img.onload=()=>{lastLoad=Date.now();console.log('[onload]',new Date().toLocaleTimeString());};
+img.onerror=(e)=>{console.log('[onerror]',new Date().toLocaleTimeString(),e);wasDown=true;console.log('[wasDown=true] onerror');setTimeout(connect,700)};
+console.log('[start]',new Date().toLocaleTimeString(),location.href);
 connect();
-setInterval(()=>{
+function doPing(){
   fetch(purl(),{cache:'no-store'}).then(r=>{
+    console.log('[ping]',new Date().toLocaleTimeString(),r.status,'wasDown='+wasDown,'fail='+failCount);
     if(r.status===403) return;
     if(r.ok){
-      if(wasDown) connect();
+      failCount=0;
+      if(wasDown){console.log('[reconnect] ping ok after down');wasDown=false;connect();}
     } else {
-      wasDown=true;
+      failCount++;
+      console.log('[ping fail]',failCount);
+      if(!wasDown){wasDown=true;console.log('[wasDown=true] fail');}
     }
-  }).catch(()=>{wasDown=true});
-},1200);
+  }).catch(err=>{
+    failCount++;
+    console.log('[ping error]',new Date().toLocaleTimeString(),err.message,'fail='+failCount,'wasDown='+wasDown);
+    if(!wasDown){wasDown=true;console.log('[wasDown=true] error');}
+  }).finally(()=>setTimeout(doPing,700));
+}
+doPing();
+// stall detection for very short outages missed by ping
+setInterval(()=>{
+  const idle=Date.now()-lastLoad;
+  if(idle>2500 && !wasDown){
+    console.log('[stall] no onload for '+idle+'ms');
+    wasDown=true;
+  }
+},1000);
 </script>
 </body></html>'''
 
