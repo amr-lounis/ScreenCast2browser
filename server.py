@@ -19,87 +19,44 @@ def is_authorized(req):
 @app.route('/')
 def index():
     return '''<html><head><title>ScreenCast->browser</title><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden;font-family:sans-serif}
-#stream{width:100%;height:100%;object-fit:contain}
-#overlay{position:fixed;inset:0;background:rgba(0,0,0,0.85);display:none;flex-direction:column;justify-content:center;align-items:center;gap:16px;color:#fff;z-index:10}
-#overlay.show{display:flex}
-.spinner{width:44px;height:44px;border:4px solid #333;border-top-color:#0f0;border-radius:50%;animation:spin 0.8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-#status{font-size:15px;opacity:0.9}
-#retry{font-size:13px;color:#aaa}
-.btn{margin-top:8px;padding:8px 18px;background:#0a84ff;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px}
-.btn:hover{background:#006ed1}
-</style>
+<style>html,body{margin:0;height:100%;background:#000}img{width:100%;height:100%;object-fit:contain}</style>
 </head>
 <body>
-<img id="stream" alt="">
-<div id="overlay">
-  <div class="spinner" id="spinner"></div>
-  <div id="status">Connecting...</div>
-  <div id="retry"></div>
-  <button class="btn" onclick="connect(true)">Reconnect now</button>
-</div>
+<img id="s">
 <script>
-const params = new URLSearchParams(window.location.search);
-const code = params.get('code') || '';
-const img = document.getElementById('stream');
-const overlay = document.getElementById('overlay');
-const statusEl = document.getElementById('status');
-const retryEl = document.getElementById('retry');
-let retryCount = 0;
-let retryTimer = null;
-let isConnected = false;
-function videoUrl(){
-  return '/video' + (code ? '?code=' + encodeURIComponent(code) : '');
+const code=new URLSearchParams(location.search).get('code')||'';
+const img=document.getElementById('s');
+function vurl(){return '/video'+(code?'?code='+encodeURIComponent(code):'')}
+function purl(){return '/ping'+(code?'?code='+encodeURIComponent(code):'')}
+let wasDown=false;
+function connect(){
+  wasDown=false;
+  try{img.src='';}catch(e){}
+  try{img.removeAttribute('src');}catch(e){}
+  void img.offsetWidth;
+  setTimeout(()=>{img.src=vurl()+(vurl().includes('?')?'&':'?')+'t='+Date.now()},80);
 }
-function videoUrlBusted(){
-  return videoUrl() + (videoUrl().includes('?') ? '&' : '?') + 't=' + Date.now();
-}
-function showOverlay(msg, sub){
-  overlay.classList.add('show');
-  statusEl.textContent = msg;
-  retryEl.textContent = sub || '';
-}
-function hideOverlay(){ overlay.classList.remove('show'); }
-function connect(manual){
-  if(retryTimer){ clearTimeout(retryTimer); retryTimer=null; }
-  if(manual) retryCount = 0;
-  isConnected = false;
-  showOverlay(retryCount===0 ? 'Connecting...' : 'Reconnecting...', retryCount>0 ? 'Attempt '+(retryCount+1) : '');
-  img.src = videoUrlBusted();
-}
-function scheduleRetry(reason){
-  if(isConnected) return;
-  retryCount++;
-  const delay = Math.min(1000 * Math.pow(1.5, retryCount-1), 10000);
-  const sec = (delay/1000).toFixed(1);
-  showOverlay(reason || 'Connection lost', 'Retrying in '+sec+'s (attempt '+retryCount+')');
-  retryTimer = setTimeout(()=> connect(false), delay);
-}
-function handleError(reason){
-  fetch(videoUrlBusted(), {method:'HEAD', cache:'no-store'}).then(r=>{
-    if(r.status===403){ showOverlay('Access denied - invalid code', 'Check ?code= in URL'); return; }
-    if(r.ok){ hideOverlay(); return; }
-    scheduleRetry(reason);
-  }).catch(()=> scheduleRetry(reason));
-}
-img.onload = function(){
-  isConnected = true;
-  hideOverlay();
-  retryCount = 0;
-};
-img.onerror = function(){
-  isConnected = false;
-  // MJPEG onerror fires on real disconnect only, not per frame
-  handleError('Connection error');
-};
-window.addEventListener('online', ()=> connect(true));
-window.addEventListener('beforeunload', ()=> { if(retryTimer) clearTimeout(retryTimer); });
-connect(false);
+img.onerror=()=>{wasDown=true;setTimeout(connect,600)};
+connect();
+setInterval(()=>{
+  fetch(purl(),{cache:'no-store'}).then(r=>{
+    if(r.status===403) return;
+    if(r.ok){
+      if(wasDown) connect();
+    } else {
+      wasDown=true;
+    }
+  }).catch(()=>{wasDown=true});
+},1200);
 </script>
 </body></html>'''
+
+
+@app.route('/ping')
+def ping():
+    if not is_authorized(request):
+        abort(403)
+    return 'ok', 200
 
 
 @app.route('/video')
