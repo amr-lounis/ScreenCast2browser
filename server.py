@@ -50,10 +50,12 @@ const statusEl = document.getElementById('status');
 const retryEl = document.getElementById('retry');
 let retryCount = 0;
 let retryTimer = null;
-let stallTimer = null;
-let lastLoad = Date.now();
+let isConnected = false;
 function videoUrl(){
-  return '/video' + (code ? '?code=' + encodeURIComponent(code) : '') + '&t=' + Date.now();
+  return '/video' + (code ? '?code=' + encodeURIComponent(code) : '');
+}
+function videoUrlBusted(){
+  return videoUrl() + (videoUrl().includes('?') ? '&' : '?') + 't=' + Date.now();
 }
 function showOverlay(msg, sub){
   overlay.classList.add('show');
@@ -63,16 +65,13 @@ function showOverlay(msg, sub){
 function hideOverlay(){ overlay.classList.remove('show'); }
 function connect(manual){
   if(retryTimer){ clearTimeout(retryTimer); retryTimer=null; }
-  if(stallTimer){ clearTimeout(stallTimer); }
   if(manual) retryCount = 0;
+  isConnected = false;
   showOverlay(retryCount===0 ? 'Connecting...' : 'Reconnecting...', retryCount>0 ? 'Attempt '+(retryCount+1) : '');
-  img.src = videoUrl();
-  lastLoad = Date.now();
-  stallTimer = setTimeout(()=> {
-    if(Date.now() - lastLoad > 3500){ handleError('Connection stalled'); }
-  }, 4000);
+  img.src = videoUrlBusted();
 }
 function scheduleRetry(reason){
+  if(isConnected) return;
   retryCount++;
   const delay = Math.min(1000 * Math.pow(1.5, retryCount-1), 10000);
   const sec = (delay/1000).toFixed(1);
@@ -80,18 +79,22 @@ function scheduleRetry(reason){
   retryTimer = setTimeout(()=> connect(false), delay);
 }
 function handleError(reason){
-  if(stallTimer) clearTimeout(stallTimer);
-  fetch(videoUrl(), {method:'HEAD', cache:'no-store'}).then(r=>{
+  fetch(videoUrlBusted(), {method:'HEAD', cache:'no-store'}).then(r=>{
     if(r.status===403){ showOverlay('Access denied - invalid code', 'Check ?code= in URL'); return; }
+    if(r.ok){ hideOverlay(); return; }
     scheduleRetry(reason);
   }).catch(()=> scheduleRetry(reason));
 }
 img.onload = function(){
-  hideOverlay(); retryCount = 0; lastLoad = Date.now();
-  if(stallTimer) clearTimeout(stallTimer);
-  stallTimer = setTimeout(()=> handleError('Stream timeout'), 5000);
+  isConnected = true;
+  hideOverlay();
+  retryCount = 0;
 };
-img.onerror = function(){ handleError('Connection error'); };
+img.onerror = function(){
+  isConnected = false;
+  // MJPEG onerror fires on real disconnect only, not per frame
+  handleError('Connection error');
+};
 window.addEventListener('online', ()=> connect(true));
 window.addEventListener('beforeunload', ()=> { if(retryTimer) clearTimeout(retryTimer); });
 connect(false);

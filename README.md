@@ -4,6 +4,12 @@ Stream any monitor to any browser on your local network. No client install requi
 
 > Full name: **ScreenCast 2 browser** — short: `ScreenCast->browser`
 
+<p align="center">
+  <img src="readme/01.JPG" alt="GUI" width="420">
+  <br>
+  <em>Control Panel</em>
+</p>
+
 ## Features
 - High-performance capture via DXGI (`dxcam`)
 - Auto-detect monitors with resolution
@@ -29,6 +35,12 @@ gui.py               # Tkinter UI
 pip install -r requirements.txt
 ```
 
+## Screenshots
+
+| Control Panel | Browser View |
+|---------------|--------------|
+| ![GUI](readme/01.JPG) | ![Browser](readme/02.JPG) |
+
 ## Run
 ```bat
 python main.py
@@ -37,6 +49,12 @@ Select monitor → Start Server → open `http://IP:PORT/?code=1234`
 
 - With code: `http://IP:8080/?code=1234`
 - Without code: leave field empty
+
+<p align="center">
+  <img src="readme/02.JPG" alt="Browser streaming" width="700">
+  <br>
+  <em>Browser streaming with auto-reconnect overlay</em>
+</p>
 
 ## Build EXE (portable)
 
