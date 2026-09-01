@@ -299,7 +299,7 @@ class App(tk.Tk):
 
         cam = None
         try:
-            # Phase 4: BGRA + numpy backend = no OpenCV required (leanest)
+            # BGRA + numpy backend (leanest)
             try:
                 cam = dxcam.create(output_idx=monitor_idx, output_color="BGRA", processor_backend="numpy")
             except TypeError:

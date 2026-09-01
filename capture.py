@@ -1,7 +1,7 @@
 """
-capture.py - Screen capture and frame generation (Phase 4: no OpenCV)
+capture.py - Screen capture and frame generation
 Uses simplejpeg (libjpeg-turbo) for fast JPEG, Pillow as fallback, numpy for cursor.
-BGRA is the leanest dxcam path - no cv2 required.
+BGRA is the leanest dxcam path - direct simplejpeg encoding without conversion.
 """
 import io
 import logging
@@ -109,14 +109,14 @@ def _encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
         try:
             if frame.ndim == 3 and frame.shape[2] == 4:
                 # BGRA direct - no numpy conversion (leanest dxcam mode)
-                # colorsubsampling='420' matches cv2 default size and is fastest
+                # colorsubsampling='420' is smallest/fastest (4:2:0 chroma subsampling)
                 return simplejpeg.encode_jpeg(
                     frame, quality=quality, colorspace="BGRA", colorsubsampling="420", fastdct=True
                 )
             elif frame.ndim == 3 and frame.shape[2] == 3:
                 # 3-channel: dxcam default was RGB, but BGRA mode gives 4ch
                 # Treat as BGR (if BGRA sliced) vs RGB (default). Since we request BGRA, this is fallback.
-                # Use BGR to match previous cv2 behavior (RGB->BGR). If colors inverted, change to "RGB".
+                # Use BGR (BGRA sliced). If colors inverted, change to "RGB".
                 # We try BGR first; it's zero-copy if frame is already BGR contiguous.
                 # For RGB input, BGR will invert R/B - user can toggle by changing colorspace.
                 return simplejpeg.encode_jpeg(
@@ -139,8 +139,8 @@ def _encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
                 rgb = np.ascontiguousarray(frame[:, :, 2::-1])
             elif frame.ndim == 3 and frame.shape[2] == 3:
                 # Assume BGR (from BGRA) -> RGB, so flip. If frame is already RGB, this will invert;
-                # but BGRA path is primary, so flip is correct. For legacy RGB, no flip would be needed.
-                # We treat 3ch as BGR to match previous cv2 pipeline.
+                # but BGRA path is primary, so flip is correct.
+                # We treat 3ch as BGR (BGRA primary path).
                 rgb = np.ascontiguousarray(frame[:, :, ::-1])
             else:
                 rgb = frame
@@ -157,7 +157,7 @@ def _encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
 
 
 def generate() -> Generator[bytes, None, None]:
-    """Frame generator - runs in Flask thread (Phase 4: no cv2, simplejpeg)"""
+    """Frame generator - runs in Flask thread (simplejpeg + Pillow)"""
     logger.info("generate started (simplejpeg=%s, PIL=%s)", HAS_SIMPLEJPEG, HAS_PIL)
     if not HAS_SIMPLEJPEG and not HAS_PIL:
         logger.error("No encoder available - install simplejpeg or Pillow")

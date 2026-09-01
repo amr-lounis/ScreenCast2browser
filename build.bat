@@ -8,7 +8,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Building portable EXE...
-REM Phase 4: no OpenCV - use simplejpeg + Pillow (lean)
+REM Use simplejpeg + Pillow (lean)
 python -m PyInstaller --noconfirm --clean ^
   --onefile ^
   --windowed ^

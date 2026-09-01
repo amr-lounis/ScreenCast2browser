@@ -50,7 +50,7 @@ def get_available_monitors() -> List[Dict[str, Any]]:
         except Exception as e:
             logger.debug("Win32 monitor detection failed: %s", e)
 
-    # Fallback: probe via dxcam (BGRA + numpy = no cv2, leanest)
+    # Fallback: probe via dxcam (BGRA + numpy, leanest)
     for i in range(5):
         c = None
         try:

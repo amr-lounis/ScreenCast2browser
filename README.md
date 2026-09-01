@@ -53,13 +53,14 @@ python main.py 2> app.log
 ```
 Levels: `INFO` for start/stop, `DEBUG` for frame/cursor details.
 
-## Requirements (pinned Phase 3)
+## Requirements (pinned)
 ```
 dxcam==0.3.0
-opencv-python==4.8.1.78
 Flask==3.0.3
 Werkzeug==3.0.3
 pywin32==311
 numpy==1.26.4
 comtypes==1.4.8
+Pillow==11.0.0
+simplejpeg==1.9.0
 ```
