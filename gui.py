@@ -3,6 +3,7 @@ gui.py - Tkinter control panel
 """
 import time
 import threading
+import secrets
 import tkinter as tk
 from tkinter import ttk
 import webbrowser
@@ -27,7 +28,12 @@ def create_gui():
     quality_var = tk.IntVar(value=config.config["quality"])
     port_var = tk.StringVar(value="8080")
     show_cursor = tk.BooleanVar(value=config.config["show_cursor"])
-    access_code_var = tk.StringVar(value="1234")
+    # Generate random code if default is still 1234 to avoid hardcoded public code
+    _initial_code = config.config.get("access_code", "")
+    if _initial_code == "1234":
+        # keep 1234 as default for backward compat, but allow user to generate
+        pass
+    access_code_var = tk.StringVar(value=_initial_code)
     link_var = tk.StringVar(value="Server stopped")
 
     main_frame = ttk.Frame(root, padding=20)
@@ -42,19 +48,21 @@ def create_gui():
     monitor_combo = ttk.Combobox(row1, textvariable=monitor_label_var, values=[m["label"] for m in monitors], width=26, state="readonly")
 
     def refresh_monitors():
-        if config.is_running:
+        if not config.stop_event.is_set():
             link_var.set("Stop server before refreshing")
             return
         new_list = get_available_monitors()
-        config.available_monitors[:] = new_list
-        config.label_to_idx.clear()
-        config.label_to_idx.update({m["label"]: m["idx"] for m in new_list})
-        config.idx_to_label.clear()
-        config.idx_to_label.update({m["idx"]: m["label"] for m in new_list})
+        with config.lock:
+            config.available_monitors[:] = new_list
+            config.label_to_idx.clear()
+            config.label_to_idx.update({m["label"]: m["idx"] for m in new_list})
+            config.idx_to_label.clear()
+            config.idx_to_label.update({m["idx"]: m["label"] for m in new_list})
         monitor_combo.config(values=[m["label"] for m in new_list])
         if new_list:
             monitor_label_var.set(new_list[0]["label"])
-            config.config["monitor_idx"] = new_list[0]["idx"]
+            with config.lock:
+                config.config["monitor_idx"] = new_list[0]["idx"]
         link_var.set(f"Found {len(new_list)} monitor(s)")
 
     refresh_btn = ttk.Button(row1, text="↻", width=3, command=refresh_monitors)
@@ -72,7 +80,8 @@ def create_gui():
 
     def on_fps_change(*args):
         fps_label.config(text=str(int(fps_var.get())))
-        config.config["fps"] = int(fps_var.get())
+        with config.lock:
+            config.config["fps"] = int(fps_var.get())
     fps_var.trace_add("write", on_fps_change)
 
     # Quality row
@@ -86,21 +95,26 @@ def create_gui():
 
     def on_quality_change(*args):
         quality_label.config(text=str(int(quality_var.get())))
-        config.config["quality"] = int(quality_var.get())
+        with config.lock:
+            config.config["quality"] = int(quality_var.get())
     quality_var.trace_add("write", on_quality_change)
 
     def on_cursor_toggle(*args):
-        config.config["show_cursor"] = bool(show_cursor.get())
+        with config.lock:
+            config.config["show_cursor"] = bool(show_cursor.get())
     show_cursor.trace_add("write", on_cursor_toggle)
 
     def on_monitor_change(*args):
         try:
             label = monitor_label_var.get()
-            idx = config.label_to_idx.get(label)
+            with config.lock:
+                idx = config.label_to_idx.get(label)
             if idx is not None:
-                config.config["monitor_idx"] = int(idx)
+                with config.lock:
+                    config.config["monitor_idx"] = int(idx)
             else:
-                config.config["monitor_idx"] = int(label.split(":")[0].strip())
+                with config.lock:
+                    config.config["monitor_idx"] = int(label.split(":")[0].strip())
         except Exception:
             pass
     monitor_label_var.trace_add("write", on_monitor_change)
@@ -117,7 +131,7 @@ def create_gui():
     row5 = ttk.Frame(main_frame)
     row5.pack(fill=tk.X, pady=5)
     ttk.Label(row5, text="Access Code:").pack(side=tk.LEFT)
-    access_entry = ttk.Entry(row5, textvariable=access_code_var, width=18, show="*")
+    access_entry = ttk.Entry(row5, textvariable=access_code_var, width=12, show="*")
     access_entry.pack(side=tk.RIGHT)
 
     def toggle_code():
@@ -125,10 +139,20 @@ def create_gui():
         toggle_btn.config(text="Hide" if access_entry.cget("show") == "" else "Show")
     toggle_btn = ttk.Button(row5, text="Show", width=6, command=toggle_code)
     toggle_btn.pack(side=tk.RIGHT, padx=(5, 0))
+
+    def generate_code():
+        new_code = config.generate_access_code(8)
+        access_code_var.set(new_code)
+        access_entry.config(show="")
+        toggle_btn.config(text="Hide")
+
+    gen_btn = ttk.Button(row5, text="Gen", width=5, command=generate_code)
+    gen_btn.pack(side=tk.RIGHT, padx=(3, 0))
     ttk.Label(main_frame, text="Empty = no protection", font=('Arial', 7), foreground="gray").pack(anchor=tk.W)
 
     def on_access_code_change(*args):
-        config.config["access_code"] = access_code_var.get().strip()
+        with config.lock:
+            config.config["access_code"] = access_code_var.get().strip()
     access_code_var.trace_add("write", on_access_code_change)
 
     ttk.Separator(main_frame).pack(fill=tk.X, pady=15)
@@ -158,9 +182,9 @@ def create_gui():
     status_label = ttk.Label(main_frame, text="STOPPED", foreground="red")
     status_label.pack(pady=5)
 
-    # Start/Stop logic
+    # Start/Stop logic (Phase 1: thread-safe)
     def start():
-        if config.is_running:
+        if not config.stop_event.is_set():
             return
         try:
             port = int(port_var.get())
@@ -180,29 +204,41 @@ def create_gui():
         except Exception:
             pass
 
-        config.config["fps"] = fps
-        config.config["quality"] = quality
-        config.config["show_cursor"] = bool(show_cursor.get())
-        config.config["monitor_idx"] = monitor_idx
-        config.config["access_code"] = access_code_var.get().strip()
+        with config.lock:
+            config.config["fps"] = fps
+            config.config["quality"] = quality
+            config.config["show_cursor"] = bool(show_cursor.get())
+            config.config["monitor_idx"] = monitor_idx
+            config.config["access_code"] = access_code_var.get().strip()
 
+        cam = None
         try:
             cam = dxcam.create(output_idx=monitor_idx)
             if cam is None:
                 raise RuntimeError(f"Cannot create capture for monitor {monitor_idx} (not found)")
             cam.start(target_fps=fps, video_mode=True)
-            config.camera = cam
-            config.is_running = True
+            with config.lock:
+                config.camera = cam
+            config.set_running(True)
 
+            # Start server in daemon thread; run_server will set config.server under lock
             config.server_thread = threading.Thread(target=run_server, args=(port,), daemon=True)
             config.server_thread.start()
-            time.sleep(0.5)
-            if config.server_thread and not config.server_thread.is_alive() and config.HAS_WERKZEUG:
-                raise RuntimeError("Server failed to start (port busy?)")
+            # Wait briefly for bind - use stop_event.wait instead of sleep to be interruptible
+            # Check if thread died (port busy) - run_server raises OSError
+            config.stop_event.wait(0.7)
+            # If thread died quickly and server is None, likely port busy
+            if config.server_thread and not config.server_thread.is_alive():
+                # Thread exited - check if server was never set (bind failure)
+                with config.server_lock:
+                    srv = config.server
+                if srv is None and config.HAS_WERKZEUG:
+                    raise RuntimeError("Server failed to start (port busy or permission?)")
 
             ip = get_ip()
             base = f"http://{ip}:{port}"
-            code = config.config["access_code"]
+            with config.lock:
+                code = config.config["access_code"]
             link = f"{base}/?code={code}" if code else base
             if code:
                 print(f"Video URL: {base}/video?code={code}")
@@ -210,30 +246,69 @@ def create_gui():
             status_label.config(text="RUNNING", foreground="green")
             start_btn.config(text="Stop Server", command=stop)
         except Exception as e:
-            config.is_running = False
-            if config.camera:
-                try: config.camera.stop()
-                except Exception: pass
-                config.camera = None
-            if config.HAS_WERKZEUG and config.server:
-                try: config.server.shutdown()
-                except Exception: pass
+            config.set_running(False)
+            # Cleanup camera - ensure stop() is called to avoid thread leak
+            with config.lock:
+                cur_cam = config.camera
+            if cur_cam is not None:
+                try:
+                    cur_cam.stop()
+                except Exception:
+                    pass
+                with config.lock:
+                    config.camera = None
+            # Also cleanup the local cam if different
+            if cam is not None and cam is not cur_cam:
+                try:
+                    cam.stop()
+                except Exception:
+                    pass
+            # Shutdown server without blocking GUI thread
+            with config.server_lock:
+                srv = config.server
+            if srv is not None and config.HAS_WERKZEUG:
+                try:
+                    srv.shutdown()
+                except Exception:
+                    pass
+                with config.server_lock:
+                    if config.server is srv:
+                        config.server = None
             link_var.set(f"Error: {e}")
             status_label.config(text="ERROR", foreground="red")
 
     def stop():
-        config.is_running = False
-        time.sleep(0.2)
-        if config.HAS_WERKZEUG and config.server:
-            try: config.server.shutdown()
-            except Exception: pass
-            config.server = None
-        if config.camera:
-            try: config.camera.stop()
-            except Exception: pass
-            try: del config.camera
-            except Exception: pass
-            config.camera = None
+        # Idempotent stop - safe to call multiple times
+        was_running = not config.stop_event.is_set()
+        config.set_running(False)
+        # Give generate() loop a moment to exit (non-blocking wait handled inside generate)
+        # Shutdown server in background to avoid freezing GUI (shutdown can block)
+        def _do_shutdown():
+            with config.server_lock:
+                srv = config.server
+            if srv is not None and config.HAS_WERKZEUG:
+                try:
+                    srv.shutdown()
+                except Exception:
+                    pass
+                # run_server's finally will clear, but also clear here
+                with config.server_lock:
+                    if config.server is srv:
+                        config.server = None
+        if was_running:
+            threading.Thread(target=_do_shutdown, daemon=True).start()
+        # Stop camera (may take ~100ms)
+        with config.lock:
+            cam = config.camera
+        if cam is not None:
+            try:
+                cam.stop()
+            except Exception:
+                pass
+            with config.lock:
+                # double-check still same object
+                if config.camera is cam:
+                    config.camera = None
         link_var.set("Server stopped")
         status_label.config(text="STOPPED", foreground="red")
         start_btn.config(text="Start Server", command=start)

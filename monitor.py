@@ -5,12 +5,9 @@ import socket
 import dxcam
 import config
 
-try:
-    import win32api
-    HAS_WIN32 = config.HAS_WIN32
-except ImportError:
-    HAS_WIN32 = False
-    win32api = None
+# Use centralized HAS_WIN32/win32api from config (Phase 1 unification)
+HAS_WIN32 = config.HAS_WIN32
+win32api = config.win32api
 
 
 def get_ip():
@@ -39,7 +36,7 @@ def get_available_monitors():
                 is_primary = bool(info.get('Flags', 0) & 1)
                 dev = info.get('Device', f"DISPLAY{i+1}")
                 short_dev = dev.split("\\")[-1] if "\\" in dev else dev
-                label = f"{i}: {w}x{h} @ ({rc[0]},{rc[1]})" + (" [Primary]" if is_primary else f" [{short_dev}]")
+                label = f"{i}: {w}x{hgt} @ ({rc[0]},{rc[1]})" + (" [Primary]" if is_primary else f" [{short_dev}]")
                 monitors.append({"idx": i, "label": label, "rect": rc, "primary": is_primary})
             if monitors:
                 return monitors
@@ -47,18 +44,28 @@ def get_available_monitors():
             pass
     # Fallback: probe via dxcam
     for i in range(5):
+        c = None
         try:
             c = dxcam.create(output_idx=i)
             if c is not None:
+                monitors.append({"idx": i, "label": f"{i}: Monitor {i}", "rect": None, "primary": i == 0})
+            else:
+                # output_idx not available, try next instead of breaking (fixes missing monitor 2 when 1 absent)
+                continue
+        except Exception:
+            continue
+        finally:
+            if c is not None:
                 try:
+                    # dxcam may need stop() before deletion to avoid thread leak
+                    if hasattr(c, "stop"):
+                        try:
+                            c.stop()
+                        except Exception:
+                            pass
                     del c
                 except Exception:
                     pass
-                monitors.append({"idx": i, "label": f"{i}: Monitor {i}", "rect": None, "primary": i == 0})
-            else:
-                break
-        except Exception:
-            break
     if not monitors:
         monitors = [{"idx": 0, "label": "0: Default 1920x1080", "rect": (0, 0, 1920, 1080), "primary": True}]
     return monitors
