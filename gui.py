@@ -362,13 +362,41 @@ class App(tk.Tk):
                     cur_cam.stop()
                 except Exception as ex:
                     logger.debug("Camera stop error: %s", ex)
+                for _m in ("release", "close"):
+                    if hasattr(cur_cam, _m):
+                        try:
+                            getattr(cur_cam, _m)()
+                        except Exception:
+                            pass
+                        break
                 with config.lock:
                     config.camera = None
+                try:
+                    del cur_cam
+                except Exception:
+                    pass
             if cam is not None and cam is not cur_cam:
                 try:
                     cam.stop()
                 except Exception as ex:
                     logger.debug("Local cam stop error: %s", ex)
+                for _m in ("release", "close"):
+                    if hasattr(cam, _m):
+                        try:
+                            getattr(cam, _m)()
+                        except Exception:
+                            pass
+                        break
+                try:
+                    del cam
+                except Exception:
+                    pass
+            try:
+                import gc
+
+                gc.collect()
+            except Exception:
+                pass
             with config.server_lock:
                 srv = config.server
             if srv is not None and config.HAS_WERKZEUG:
@@ -424,9 +452,27 @@ class App(tk.Tk):
                 logger.info("Camera stopped")
             except Exception as ex:
                 logger.debug("Camera stop error: %s", ex)
+            # Explicit COM release before clearing ref - prevents AV in __del__ after CoUninitialize
+            for _m in ("release", "close"):
+                if hasattr(cam, _m):
+                    try:
+                        getattr(cam, _m)()
+                    except Exception:
+                        pass
+                    break
             with config.lock:
                 if config.camera is cam:
                     config.camera = None
+            try:
+                del cam
+            except Exception:
+                pass
+            try:
+                import gc
+
+                gc.collect()
+            except Exception:
+                pass
         self.link_var.set("Server stopped")
         self.status_label.config(text="STOPPED", foreground="red")
         self.start_btn.config(text="Start Server", command=self._start)

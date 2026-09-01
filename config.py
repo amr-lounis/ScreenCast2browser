@@ -16,6 +16,27 @@ except ImportError:
     HAS_WIN32 = False
     win32api = None  # type: ignore
 
+# --- comtypes: suppress AV on GC after CoUninitialize (dxcam) ---
+# dxcam holds IDXGI COM pointers; if GC runs after CoUninitialize,
+# comtypes._compointer_base.__del__ raises OSError: access violation 0xFFFFFFFFFFFFFFFF
+# This is "Exception ignored" (harmless) but noisy. Make __del__ swallow OSError.
+try:
+    import comtypes._post_coinit.unknwn as _ct_unknwn  # type: ignore
+
+    _orig_com_del = _ct_unknwn._compointer_base.__del__  # type: ignore
+
+    def _safe_com_del(self):  # type: ignore
+        try:
+            return _orig_com_del(self)
+        except OSError:
+            return None
+        except Exception:
+            return None
+
+    _ct_unknwn._compointer_base.__del__ = _safe_com_del  # type: ignore
+except Exception:
+    pass
+
 try:
     from werkzeug.serving import make_server  # type: ignore
     HAS_WERKZEUG: bool = True

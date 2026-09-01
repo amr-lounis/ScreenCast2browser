@@ -73,9 +73,27 @@ def get_available_monitors() -> List[Dict[str, Any]]:
                             c.stop()
                         except Exception as e:
                             logger.debug("dxcam stop failed idx %d: %s", i, e)
-                    del c
+                    # Explicit release before GC - avoids AV in comtypes __del__ after CoUninitialize
+                    for _meth in ("release", "close"):
+                        if hasattr(c, _meth):
+                            try:
+                                getattr(c, _meth)()
+                            except Exception:
+                                pass
+                            break
                 except Exception as e:
                     logger.debug("dxcam cleanup failed idx %d: %s", i, e)
+                finally:
+                    try:
+                        del c
+                    except Exception:
+                        pass
+                    try:
+                        import gc
+
+                        gc.collect()
+                    except Exception:
+                        pass
     if not monitors:
         logger.warning("No monitors detected, using default")
         monitors = [{"idx": 0, "label": "0: Default 1920x1080", "rect": (0, 0, 1920, 1080), "primary": True}]
