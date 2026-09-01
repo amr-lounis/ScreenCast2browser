@@ -1,53 +1,53 @@
 """
-capture.py - Screen capture and frame generation
+capture.py - Screen capture and frame generation (Phase 3: typed & logged)
 """
+import logging
 import time
+from typing import Generator
+
 import cv2
 import config
 from monitor import get_monitor_offset
 
+logger = logging.getLogger(__name__)
+
 # Centralized HAS_WIN32/win32api (Phase 1)
-HAS_WIN32 = config.HAS_WIN32
+HAS_WIN32: bool = config.HAS_WIN32
 win32api = config.win32api
 
 
-def generate():
+def generate() -> Generator[bytes, None, None]:
     """Frame generator - runs in Flask thread (Phase 2: perf_counter + no extra copy)"""
+    logger.info("generate started")
     while not config.stop_event.is_set():
         frame_start = time.perf_counter()
-        # Thread-safe camera read
         with config.lock:
             cam = config.camera
         if config.stop_event.is_set():
             break
         try:
-            frame = cam.get_latest_frame() if cam else None
-        except Exception:
+            frame = cam.get_latest_frame() if cam else None  # type: ignore
+        except Exception as e:
+            logger.debug("get_latest_frame failed: %s", e)
             frame = None
         if frame is None:
             if config.stop_event.wait(0.01):
                 break
             continue
 
-        # dxcam returns RGBA/RGB while cv2.imencode expects BGR
-        # Avoid extra frame.copy() - cv2.cvtColor creates a new buffer anyway
-        # Only copy if we need to draw cursor without conversion path? Handled below.
         try:
             if len(frame.shape) == 3:
                 if frame.shape[2] == 4:
                     frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
                 elif frame.shape[2] == 3:
                     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                # else: keep as is (e.g., BGR already)
-            # For 2D grayscale, keep as is
             h, w = frame.shape[0], frame.shape[1]
-        except Exception:
-            # Invalid frame shape
+        except Exception as e:
+            logger.debug("frame shape handling failed: %s", e)
             if config.stop_event.wait(0.01):
                 break
             continue
 
-        # Snapshot config under lock to avoid torn reads
         with config.lock:
             show_cur = config.config["show_cursor"]
             quality = config.config["quality"]
@@ -56,20 +56,20 @@ def generate():
 
         if show_cur and HAS_WIN32 and win32api is not None:
             try:
-                x, y = win32api.GetCursorPos()
+                x, y = win32api.GetCursorPos()  # type: ignore
                 off_x, off_y = get_monitor_offset(monitor_idx)
                 vx = x - off_x
                 vy = y - off_y
                 if 0 <= vx < w and 0 <= vy < h:
-                    # Draw directly on BGR frame (already converted)
                     cv2.circle(frame, (vx, vy), 8, (0, 255, 0), 2)
                     cv2.drawMarker(frame, (vx, vy), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("cursor draw failed: %s", e)
 
         try:
             ok, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-        except Exception:
+        except Exception as e:
+            logger.debug("imencode failed: %s", e)
             ok, jpeg = False, None
         if not ok or jpeg is None:
             if config.stop_event.wait(0.01):
@@ -78,9 +78,11 @@ def generate():
 
         try:
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-        except (GeneratorExit, BrokenPipeError, ConnectionAbortedError, OSError):
+        except (GeneratorExit, BrokenPipeError, ConnectionAbortedError, OSError) as e:
+            logger.info("client disconnected: %s", e)
             break
-        except Exception:
+        except Exception as e:
+            logger.exception("generate yield failed: %s", e)
             break
 
         if fps > 0:
@@ -89,4 +91,4 @@ def generate():
             if sleep_time > 0:
                 if config.stop_event.wait(sleep_time):
                     break
-            # else: we're behind schedule, yield next frame immediately (no sleep)
+    logger.info("generate stopped")

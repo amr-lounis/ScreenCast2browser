@@ -8,16 +8,12 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Building portable EXE...
+REM Phase 3: removed redundant --add-data for .py files (auto-discovered via imports)
 python -m PyInstaller --noconfirm --clean ^
   --onefile ^
   --windowed ^
   --name ScreenCast-browser ^
   --icon NONE ^
-  --add-data "config.py;." ^
-  --add-data "monitor.py;." ^
-  --add-data "capture.py;." ^
-  --add-data "server.py;." ^
-  --add-data "gui.py;." ^
   --hidden-import dxcam ^
   --hidden-import cv2 ^
   --hidden-import flask ^

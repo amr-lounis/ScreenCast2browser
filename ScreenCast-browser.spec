@@ -1,7 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('config.py', '.'), ('monitor.py', '.'), ('capture.py', '.'), ('server.py', '.'), ('gui.py', '.')]
+# Phase 3: py files are auto-discovered via imports, no need for datas add-data
+datas = []
 binaries = []
 hiddenimports = ['dxcam', 'cv2', 'flask', 'werkzeug', 'win32api', 'win32gui', 'win32con']
 tmp_ret = collect_all('dxcam')
