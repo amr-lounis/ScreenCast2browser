@@ -1,5 +1,5 @@
 """
-server.py - Flask server and streaming (Phase 3: typed & logged)
+server.py - Flask server and streaming (Phase 4: fixed restart stutter)
 """
 import logging
 import time
@@ -78,35 +78,52 @@ let lastLoad=Date.now();
 let retryDelay=700;
 let reconnectTimer=null;
 let stallTimer=null;
+let framePoll=null;
 let connecting=false;
+let abortCtrl=null;
+let lastWidth=0;
 function setStatus(t){ statusEl.textContent=t; statusEl.style.display=t?'block':'none'; }
 function vurlWithCacheBust(){
   const base=vurl();
-  return base + (base.includes('?') ? '&' : '?') + 't=' + Date.now();
+  return base + (base.includes('?') ? '&' : '?') + 't=' + Date.now() + '&r=' + Math.random().toString(36).slice(2,7);
 }
 function connect(){
   if(connecting) return;
   connecting=true;
+  // reset state - critical for restart case
+  retryDelay=700;
+  lastLoad=Date.now();
+  clearTimeout(reconnectTimer); reconnectTimer=null;
+  if(abortCtrl) try{abortCtrl.abort();}catch(e){}
+  abortCtrl=null;
   try{ img.src=''; img.removeAttribute('src'); }catch(e){}
+  // force abort previous request in some browsers
+  try{ if(img.decode) {} }catch(e){}
   const u=vurlWithCacheBust();
   console.log('[connect]',new Date().toLocaleTimeString(),u);
   setStatus('Connecting...');
-  lastLoad=Date.now();
-  setTimeout(()=>{ img.src=u; connecting=false; }, 50);
+  setTimeout(()=>{ img.src=u; connecting=false; }, 80);
 }
 img.onload=()=>{
   lastLoad=Date.now();
   retryDelay=700;
+  lastWidth=img.naturalWidth;
   setStatus('');
-  console.log('[onload]',new Date().toLocaleTimeString());
+  console.log('[onload]',new Date().toLocaleTimeString(), 'w='+img.naturalWidth);
 };
 img.onerror=(e)=>{
   console.log('[onerror]',new Date().toLocaleTimeString(),e);
-  fetch(vurl(),{method:'HEAD'}).then(r=>{
+  if(connecting) return;
+  if(abortCtrl) try{abortCtrl.abort();}catch(e){}
+  abortCtrl=new AbortController();
+  fetch(vurl(),{method:'HEAD', cache:'no-store', signal:abortCtrl.signal}).then(r=>{
     if(r.status===403) setStatus('403 Forbidden - wrong access code');
     else if(r.status===429) setStatus('429 Too many attempts - wait');
     else setStatus('Error - retrying in '+Math.round(retryDelay)+'ms');
-  }).catch(()=> setStatus('Network error - retrying'));
+  }).catch(err=>{
+    if(err && err.name==='AbortError') return;
+    setStatus('Network error - retrying');
+  });
   const d=retryDelay;
   retryDelay=Math.min(retryDelay*1.6, 8000);
   clearTimeout(reconnectTimer);
@@ -114,12 +131,22 @@ img.onerror=(e)=>{
 };
 console.log('[start]',new Date().toLocaleTimeString(),location.href);
 connect();
+// Poll naturalWidth to detect MJPEG frames - onload fires only once for multipart
+framePoll=setInterval(()=>{
+  if(img.naturalWidth && img.naturalWidth!==lastWidth){
+    lastWidth=img.naturalWidth;
+    lastLoad=Date.now();
+    retryDelay=700;
+    setStatus('');
+  }
+}, 500);
 stallTimer=setInterval(()=>{
   if(document.hidden) return;
+  if(connecting) return;
   const idle=Date.now()-lastLoad;
   const noFrame = !img.naturalWidth;
-  if(idle>3500 || (noFrame && idle>2000)){
-    console.log('[stall] no onload for '+idle+'ms, naturalWidth='+img.naturalWidth+' -> reconnect');
+  if(idle>4000 || (noFrame && idle>2500)){
+    console.log('[stall] idle='+idle+'ms, w='+img.naturalWidth+' -> reconnect');
     setStatus('Stalled - reconnecting...');
     connect();
   }
@@ -127,13 +154,19 @@ stallTimer=setInterval(()=>{
 document.addEventListener('visibilitychange',()=>{
   if(!document.hidden){
     console.log('[visible] resume');
-    lastLoad=Date.now();
-    connect();
+    // only reconnect if actually stalled, not every visibility change
+    const idle=Date.now()-lastLoad;
+    if(idle>2000 || !img.naturalWidth){
+      lastLoad=Date.now();
+      connect();
+    }
   }
 });
 window.addEventListener('beforeunload',()=>{
   clearInterval(stallTimer);
+  clearInterval(framePoll);
   clearTimeout(reconnectTimer);
+  if(abortCtrl) try{abortCtrl.abort();}catch(e){}
   try{ img.src=''; }catch(e){}
 });
 </script>
@@ -155,6 +188,9 @@ def video() -> Any:
     resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     resp.headers['Pragma'] = 'no-cache'
     resp.headers['Expires'] = '0'
+    # Critical for restart: force close so browser doesn't reuse stale keep-alive socket
+    resp.headers['Connection'] = 'close'
+    resp.headers['X-Accel-Buffering'] = 'no'
     return resp
 
 

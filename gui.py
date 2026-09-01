@@ -3,6 +3,7 @@ gui.py - Tkinter control panel (Phase 3: Class-based, type-hinted, logged)
 """
 import logging
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 import webbrowser
@@ -11,7 +12,7 @@ from typing import List, Dict, Any, Optional
 import dxcam
 import config
 from monitor import get_available_monitors, get_ip, init_monitors
-from server import run_server
+from server import run_server, _check_port_available
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +256,15 @@ class App(tk.Tk):
         if not config.stop_event.is_set():
             logger.debug("Start ignored - already running")
             return
+        # Ensure previous thread fully terminated before starting new one
+        old_th = config.server_thread
+        if old_th and old_th.is_alive():
+            logger.warning("Previous server thread still alive, waiting 2s")
+            old_th.join(timeout=2.0)
+            if old_th.is_alive():
+                self.link_var.set("Error: previous server still stopping, try again")
+                return
+            config.server_thread = None
         try:
             port = int(self.port_var.get())
             if not (1 <= port <= 65535):
@@ -273,6 +283,13 @@ class App(tk.Tk):
         except Exception as e:
             logger.debug("Monitor idx parse fallback: %s", e)
 
+        # Pre-check port synchronously to avoid thread bind race
+        try:
+            _check_port_available(port)
+        except OSError as e:
+            self.link_var.set(f"Port {port} busy: {e}")
+            return
+
         with config.lock:
             config.config["fps"] = fps
             config.config["quality"] = quality
@@ -282,7 +299,15 @@ class App(tk.Tk):
 
         cam = None
         try:
-            cam = dxcam.create(output_idx=monitor_idx)
+            # Phase 4: BGRA + numpy backend = no OpenCV required (leanest)
+            try:
+                cam = dxcam.create(output_idx=monitor_idx, output_color="BGRA", processor_backend="numpy")
+            except TypeError:
+                # older dxcam without processor_backend
+                cam = dxcam.create(output_idx=monitor_idx, output_color="BGRA")
+            if cam is None:
+                # fallback to default color if BGRA unsupported
+                cam = dxcam.create(output_idx=monitor_idx)
             if cam is None:
                 raise RuntimeError(f"Cannot create capture for monitor {monitor_idx} (not found)")
             cam.start(target_fps=fps, video_mode=True)
@@ -291,14 +316,30 @@ class App(tk.Tk):
             config.set_running(True)
             logger.info("Camera started on monitor %d fps=%d", monitor_idx, fps)
 
-            config.server_thread = threading.Thread(target=run_server, args=(port,), daemon=True)
-            config.server_thread.start()
-            config.stop_event.wait(0.7)
-            if config.server_thread and not config.server_thread.is_alive():
+            # Clear stale server reference before starting new thread
+            with config.server_lock:
+                config.server = None
+            th = threading.Thread(target=run_server, args=(port,), daemon=True)
+            config.server_thread = th
+            th.start()
+            # Wait for server to bind (poll instead of blind 0.7s)
+            server_ready = False
+            for _ in range(10):
+                time.sleep(0.15)
+                with config.server_lock:
+                    srv = config.server
+                if srv is not None:
+                    server_ready = True
+                    break
+                if not th.is_alive():
+                    break
+            if not th.is_alive():
                 with config.server_lock:
                     srv = config.server
                 if srv is None and config.HAS_WERKZEUG:
                     raise RuntimeError("Server failed to start (port busy or permission?)")
+            elif not server_ready:
+                logger.debug("Server thread alive but not yet ready after 1.5s")
 
             ip = get_ip()
             base = f"http://{ip}:{port}"
@@ -346,21 +387,35 @@ class App(tk.Tk):
         config.set_running(False)
         logger.info("Stopping server (was_running=%s)", was_running)
 
-        def _do_shutdown() -> None:
+        # Synchronous shutdown - critical to avoid stale keep-alive sockets causing stutter on restart
+        srv = None
+        with config.server_lock:
+            srv = config.server
+        if srv is not None and config.HAS_WERKZEUG and was_running:
+            try:
+                srv.shutdown()
+                logger.info("Server shutdown called")
+            except Exception as ex:
+                logger.debug("Server shutdown error: %s", ex)
+            th = config.server_thread
+            if th and th.is_alive():
+                th.join(timeout=2.5)
+                if th.is_alive():
+                    logger.warning("Server thread did not exit in 2.5s")
             with config.server_lock:
-                srv = config.server
-            if srv is not None and config.HAS_WERKZEUG:
-                try:
-                    srv.shutdown()
-                    logger.info("Server shutdown called")
-                except Exception as ex:
-                    logger.debug("Server shutdown error: %s", ex)
-                with config.server_lock:
-                    if config.server is srv:
-                        config.server = None
+                if config.server is srv:
+                    config.server = None
+        elif srv is not None:
+            with config.server_lock:
+                if config.server is srv:
+                    config.server = None
+            th = config.server_thread
+            if th and th.is_alive():
+                th.join(timeout=1.0)
+        # Clear thread reference if dead
+        if config.server_thread and not config.server_thread.is_alive():
+            config.server_thread = None
 
-        if was_running:
-            threading.Thread(target=_do_shutdown, daemon=True).start()
         with config.lock:
             cam = config.camera
         if cam is not None:

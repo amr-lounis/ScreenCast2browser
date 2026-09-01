@@ -8,21 +8,23 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Building portable EXE...
-REM Phase 3: removed redundant --add-data for .py files (auto-discovered via imports)
+REM Phase 4: no OpenCV - use simplejpeg + Pillow (lean)
 python -m PyInstaller --noconfirm --clean ^
   --onefile ^
   --windowed ^
   --name ScreenCast-browser ^
   --icon NONE ^
   --hidden-import dxcam ^
-  --hidden-import cv2 ^
+  --hidden-import simplejpeg ^
+  --hidden-import PIL ^
   --hidden-import flask ^
   --hidden-import werkzeug ^
   --hidden-import win32api ^
   --hidden-import win32gui ^
   --hidden-import win32con ^
   --collect-all dxcam ^
-  --collect-all cv2 ^
+  --collect-all simplejpeg ^
+  --collect-all PIL ^
   main.py
 
 if errorlevel 1 (
