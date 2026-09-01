@@ -12,12 +12,12 @@ win32api = config.win32api
 
 
 def generate():
-    """Frame generator - runs in Flask thread"""
+    """Frame generator - runs in Flask thread (Phase 2: perf_counter + no extra copy)"""
     while not config.stop_event.is_set():
+        frame_start = time.perf_counter()
         # Thread-safe camera read
         with config.lock:
             cam = config.camera
-        # Also check legacy is_running for compatibility
         if config.stop_event.is_set():
             break
         try:
@@ -25,19 +25,27 @@ def generate():
         except Exception:
             frame = None
         if frame is None:
-            # wait respectfully, but abort quickly if stopping
             if config.stop_event.wait(0.01):
                 break
             continue
 
-        frame = frame.copy()
         # dxcam returns RGBA/RGB while cv2.imencode expects BGR
-        if len(frame.shape) == 3:
-            if frame.shape[2] == 4:
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-            elif frame.shape[2] == 3:
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        h, w = frame.shape[0], frame.shape[1]
+        # Avoid extra frame.copy() - cv2.cvtColor creates a new buffer anyway
+        # Only copy if we need to draw cursor without conversion path? Handled below.
+        try:
+            if len(frame.shape) == 3:
+                if frame.shape[2] == 4:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                elif frame.shape[2] == 3:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # else: keep as is (e.g., BGR already)
+            # For 2D grayscale, keep as is
+            h, w = frame.shape[0], frame.shape[1]
+        except Exception:
+            # Invalid frame shape
+            if config.stop_event.wait(0.01):
+                break
+            continue
 
         # Snapshot config under lock to avoid torn reads
         with config.lock:
@@ -53,6 +61,7 @@ def generate():
                 vx = x - off_x
                 vy = y - off_y
                 if 0 <= vx < w and 0 <= vy < h:
+                    # Draw directly on BGR frame (already converted)
                     cv2.circle(frame, (vx, vy), 8, (0, 255, 0), 2)
                     cv2.drawMarker(frame, (vx, vy), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
             except Exception:
@@ -70,11 +79,14 @@ def generate():
         try:
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
         except (GeneratorExit, BrokenPipeError, ConnectionAbortedError, OSError):
-            # Client disconnected
             break
         except Exception:
             break
 
         if fps > 0:
-            if config.stop_event.wait(1.0 / fps):
-                break
+            elapsed = time.perf_counter() - frame_start
+            sleep_time = (1.0 / fps) - elapsed
+            if sleep_time > 0:
+                if config.stop_event.wait(sleep_time):
+                    break
+            # else: we're behind schedule, yield next frame immediately (no sleep)

@@ -72,21 +72,49 @@ def get_available_monitors():
 
 
 def get_monitor_offset(idx):
-    """Get real offset for monitor idx"""
+    """Get real offset for monitor idx - dynamic fallback, no hardcoded 1920"""
+    # 1. Check cached monitors
     for m in config.available_monitors:
         if m["idx"] == idx and m["rect"]:
             return m["rect"][0], m["rect"][1]
-    if not HAS_WIN32:
-        return (1920 if idx == 1 else 0, 0)
-    try:
-        monitors = win32api.EnumDisplayMonitors(None, None)
-        if 0 <= idx < len(monitors):
-            mon_info = win32api.GetMonitorInfo(monitors[idx][0])
-            rc = mon_info['Monitor']
-            return rc[0], rc[1]
-        return (1920 if idx == 1 else 0, 0)
-    except Exception:
-        return (1920 if idx == 1 else 0, 0)
+    # 2. Try live Win32 query if available
+    if HAS_WIN32 and win32api is not None:
+        try:
+            monitors = win32api.EnumDisplayMonitors(None, None)
+            if 0 <= idx < len(monitors):
+                mon_info = win32api.GetMonitorInfo(monitors[idx][0])
+                rc = mon_info['Monitor']
+                return rc[0], rc[1]
+            # idx out of range - try to estimate from last known monitor
+        except Exception:
+            pass
+    # 3. Estimate from cached rects (horizontal tiling assumption)
+    # Find max right edge among known monitors
+    max_right = None
+    max_bottom = None
+    for m in config.available_monitors:
+        rc = m.get("rect")
+        if rc:
+            r = rc[2]
+            b = rc[3]
+            if max_right is None or r > max_right:
+                max_right = r
+            if max_bottom is None or b > max_bottom:
+                max_bottom = b
+    if max_right is not None:
+        # If idx is beyond known count, place to the right of rightmost monitor
+        # This is better than hardcoded 1920
+        # For vertical estimation, we keep y=0
+        # If we have at least one monitor, estimate as max_right for idx>=len, else 0
+        known_idxs = sorted([m["idx"] for m in config.available_monitors if m.get("rect")])
+        if idx not in known_idxs and max_right is not None:
+            # Simple heuristic: horizontal extension
+            # If idx==1 and we know idx 0 at 0,0 1920 width, max_right=1920 -> return 1920,0 (same as before but dynamic)
+            # If multi-monitor, use max_right
+            if idx > max(known_idxs, default=-1):
+                return max_right, 0
+    # 4. Fallback: origin (safe, cursor may be off but not wildly)
+    return 0, 0
 
 
 def init_monitors():

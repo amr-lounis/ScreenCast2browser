@@ -61,32 +61,85 @@ def is_authorized(req):
 @app.route('/')
 def index():
     return '''<html><head><title>ScreenCast->browser</title><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>html,body{margin:0;height:100%;background:#000}img{width:100%;height:100%;object-fit:contain}</style>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<style>html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui}img{width:100%;height:100%;object-fit:contain}#status{position:fixed;top:8px;left:8px;background:rgba(0,0,0,0.7);padding:6px 10px;border-radius:6px;font-size:12px;max-width:90vw;word-break:break-all}</style>
 </head>
 <body>
-<img id="s">
+<img id="s" alt="Stream">
+<div id="status">Connecting...</div>
 <script>
 const code=new URLSearchParams(location.search).get('code')||'';
 const img=document.getElementById('s');
+const statusEl=document.getElementById('status');
 function vurl(){return '/video'+(code?'?code='+encodeURIComponent(code):'')}
 let lastLoad=Date.now();
-function connect(){
-  const u=vurl()+(vurl().includes('?')?'&':'?')+'t='+Date.now();
-  console.log('[connect]',new Date().toLocaleTimeString(),u);
-  lastLoad=Date.now();
-  img.src=u;
+let retryDelay=700;
+let reconnectTimer=null;
+let stallTimer=null;
+let connecting=false;
+function setStatus(t){ statusEl.textContent=t; statusEl.style.display=t?'block':'none'; }
+function vurlWithCacheBust(){
+  const base=vurl();
+  return base + (base.includes('?') ? '&' : '?') + 't=' + Date.now();
 }
-img.onload=()=>{lastLoad=Date.now();console.log('[onload]',new Date().toLocaleTimeString());};
-img.onerror=(e)=>{console.log('[onerror]',new Date().toLocaleTimeString(),e);setTimeout(connect,700);};
+function connect(){
+  if(connecting) return;
+  connecting=true;
+  // Abort previous stream to avoid connection leak
+  try{ img.src=''; img.removeAttribute('src'); }catch(e){}
+  const u=vurlWithCacheBust();
+  console.log('[connect]',new Date().toLocaleTimeString(),u);
+  setStatus('Connecting...');
+  lastLoad=Date.now();
+  // Small delay to let browser abort previous request before new
+  setTimeout(()=>{ img.src=u; connecting=false; }, 50);
+}
+img.onload=()=>{
+  lastLoad=Date.now();
+  retryDelay=700;
+  setStatus('');
+  console.log('[onload]',new Date().toLocaleTimeString());
+};
+img.onerror=(e)=>{
+  console.log('[onerror]',new Date().toLocaleTimeString(),e);
+  // Detect 403 via fetch probe (img error hides status)
+  fetch(vurl(),{method:'HEAD'}).then(r=>{
+    if(r.status===403) setStatus('403 Forbidden - wrong access code');
+    else if(r.status===429) setStatus('429 Too many attempts - wait');
+    else setStatus('Error - retrying in '+Math.round(retryDelay)+'ms');
+  }).catch(()=> setStatus('Network error - retrying'));
+  const d=retryDelay;
+  retryDelay=Math.min(retryDelay*1.6, 8000);
+  clearTimeout(reconnectTimer);
+  reconnectTimer=setTimeout(connect, d);
+};
 console.log('[start]',new Date().toLocaleTimeString(),location.href);
 connect();
-setInterval(()=>{
+// Stall detection: if no onload for fps-dependent interval, reconnect
+// Use 3 seconds + 1/fps slack; assume worst 5fps => 3200ms
+stallTimer=setInterval(()=>{
+  if(document.hidden) return;
   const idle=Date.now()-lastLoad;
-  if(idle>2500){
-    console.log('[stall] no onload for '+idle+'ms -> reconnect');
+  // Consider naturalWidth check: if img has not loaded any frame, naturalWidth==0
+  const noFrame = !img.naturalWidth;
+  if(idle>3500 || (noFrame && idle>2000)){
+    console.log('[stall] no onload for '+idle+'ms, naturalWidth='+img.naturalWidth+' -> reconnect');
+    setStatus('Stalled - reconnecting...');
     connect();
   }
-},1000);
+},1500);
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden){
+    console.log('[visible] resume');
+    lastLoad=Date.now();
+    connect();
+  }
+});
+window.addEventListener('beforeunload',()=>{
+  clearInterval(stallTimer);
+  clearTimeout(reconnectTimer);
+  try{ img.src=''; }catch(e){}
+});
 </script>
 </body></html>'''
 
@@ -102,14 +155,19 @@ def ping():
 def video():
     if not is_authorized(request):
         abort(403, description="Invalid access code")
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    resp = Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 
 def _check_port_available(port):
     """Pre-check if port is free (without SO_REUSEADDR) to detect busy port reliably."""
+    if port == 0:
+        return  # OS will assign free port
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        # Disable reuse to detect busy port (Werkzeug enables reuse by default)
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
         except Exception:
