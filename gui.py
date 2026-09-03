@@ -1,6 +1,5 @@
-"""
-gui.py - Tkinter control panel (Phase 3: Class-based, type-hinted, logged)
-"""
+"""Tkinter control panel."""
+import gc
 import logging
 import threading
 import time
@@ -9,13 +8,36 @@ from tkinter import ttk
 import webbrowser
 from typing import List, Dict, Any, Optional
 
-import dxcam
 import config
-from capture import producer_loop
-from monitor import get_available_monitors, get_ip, init_monitors
+from capture import create_camera, producer_loop
+from monitor import cache_monitors, get_available_monitors, get_ip, init_monitors
 from server import run_server, _check_port_available
 
 logger = logging.getLogger(__name__)
+
+
+def _release_cam(cam: Any) -> None:
+    """Stop + explicitly release a camera (avoids comtypes AV on GC)."""
+    if cam is None:
+        return
+    try:
+        cam.stop()
+    except Exception as e:
+        logger.debug("Camera stop error: %s", e)
+    for meth in ("release", "close"):
+        if hasattr(cam, meth):
+            try:
+                getattr(cam, meth)()
+            except Exception:
+                pass
+            break
+    with config.lock:
+        if config.camera is cam:
+            config.camera = None
+    try:
+        gc.collect()
+    except Exception:
+        pass
 
 
 class App(tk.Tk):
@@ -48,6 +70,7 @@ class App(tk.Tk):
         _initial_code: str = config.config.get("access_code", "")
         self.access_code_var = tk.StringVar(value=_initial_code)
         self.link_var = tk.StringVar(value="Server stopped")
+        self._url = ""  # raw URL behind link_var display text
 
     # --- Widgets ---
     def _create_widgets(self) -> None:
@@ -76,7 +99,7 @@ class App(tk.Tk):
         self.fps_label.pack(side=tk.RIGHT, padx=(10, 0))
         fps_scale = ttk.Scale(row2, from_=5, to=60, variable=self.fps_var, orient=tk.HORIZONTAL, length=130)
         fps_scale.pack(side=tk.RIGHT)
-        self.fps_var.trace_add("write", self._on_fps_change)
+        self.fps_var.trace_add("write", lambda *a: self._on_slider(self.fps_var, self.fps_label, "fps"))
 
         # Quality row
         row3 = ttk.Frame(main_frame)
@@ -86,7 +109,7 @@ class App(tk.Tk):
         self.quality_label.pack(side=tk.RIGHT, padx=(10, 0))
         quality_scale = ttk.Scale(row3, from_=10, to=95, variable=self.quality_var, orient=tk.HORIZONTAL, length=130)
         quality_scale.pack(side=tk.RIGHT)
-        self.quality_var.trace_add("write", self._on_quality_change)
+        self.quality_var.trace_add("write", lambda *a: self._on_slider(self.quality_var, self.quality_label, "quality"))
 
         self.show_cursor.trace_add("write", self._on_cursor_toggle)
         self.monitor_label_var.trace_add("write", self._on_monitor_change)
@@ -144,47 +167,36 @@ class App(tk.Tk):
         self.link_label.bind("<Button-3>", self._show_menu)
 
     # --- Callbacks ---
+    def _set_link(self, text: str, url: str = "") -> None:
+        self._url = url
+        self.link_var.set(text)
+
     def _refresh_monitors(self) -> None:
         if not config.stop_event.is_set():
-            self.link_var.set("Stop server before refreshing")
+            self._set_link("Stop server before refreshing")
             return
         try:
-            new_list = get_available_monitors()
+            new_list = cache_monitors(get_available_monitors())
         except Exception as e:
             logger.exception("Failed to refresh monitors: %s", e)
-            self.link_var.set(f"Error refreshing: {e}")
+            self._set_link(f"Error refreshing: {e}")
             return
-        with config.lock:
-            config.available_monitors[:] = new_list
-            config.label_to_idx.clear()
-            config.label_to_idx.update({m["label"]: m["idx"] for m in new_list})
-            config.idx_to_label.clear()
-            config.idx_to_label.update({m["idx"]: m["label"] for m in new_list})
         self.monitor_combo.config(values=[m["label"] for m in new_list])
         if new_list:
             self.monitor_label_var.set(new_list[0]["label"])
             with config.lock:
                 config.config["monitor_idx"] = new_list[0]["idx"]
-        self.link_var.set(f"Found {len(new_list)} monitor(s)")
+        self._set_link(f"Found {len(new_list)} monitor(s)")
         logger.info("Refreshed monitors: %d found", len(new_list))
 
-    def _on_fps_change(self, *args: Any) -> None:
+    def _on_slider(self, var: Any, label: Any, key: str) -> None:
         try:
-            val = int(self.fps_var.get())
-            self.fps_label.config(text=str(val))
+            val = int(var.get())
+            label.config(text=str(val))
             with config.lock:
-                config.config["fps"] = val
+                config.config[key] = val  # type: ignore
         except Exception as e:
-            logger.debug("FPS change error: %s", e)
-
-    def _on_quality_change(self, *args: Any) -> None:
-        try:
-            val = int(self.quality_var.get())
-            self.quality_label.config(text=str(val))
-            with config.lock:
-                config.config["quality"] = val
-        except Exception as e:
-            logger.debug("Quality change error: %s", e)
+            logger.debug("%s change error: %s", key, e)
 
     def _on_cursor_toggle(self, *args: Any) -> None:
         with config.lock:
@@ -193,21 +205,18 @@ class App(tk.Tk):
     def _on_monitor_change(self, *args: Any) -> None:
         try:
             label = self.monitor_label_var.get()
+            idx = config.label_to_idx.get(label)
+            if idx is None:
+                idx = int(label.split(":")[0].strip())
             with config.lock:
-                idx = config.label_to_idx.get(label)
-            if idx is not None:
-                with config.lock:
-                    config.config["monitor_idx"] = int(idx)
-            else:
-                with config.lock:
-                    config.config["monitor_idx"] = int(label.split(":")[0].strip())
+                config.config["monitor_idx"] = int(idx)
         except Exception as e:
             logger.debug("Monitor change error: %s", e)
 
     def _toggle_code(self) -> None:
-        show = self.access_entry.cget("show")
-        self.access_entry.config(show="" if show == "*" else "*")
-        self.toggle_btn.config(text="Hide" if self.access_entry.cget("show") == "" else "Show")
+        hidden = self.access_entry.cget("show") == "*"
+        self.access_entry.config(show="" if hidden else "*")
+        self.toggle_btn.config(text="Hide" if hidden else "Show")
 
     def _generate_code(self) -> None:
         new_code = config.generate_access_code(8)
@@ -221,7 +230,7 @@ class App(tk.Tk):
             config.config["access_code"] = self.access_code_var.get().strip()
 
     def _copy_link(self) -> None:
-        url = self.link_var.get().strip()
+        url = self._url.strip()
         if not url.startswith("http"):
             return
         try:
@@ -234,69 +243,78 @@ class App(tk.Tk):
             logger.debug("Copy failed: %s", e)
 
     def _open_link(self, event: Optional[Any] = None) -> str:
-        url = self.link_var.get().strip()
-        if "  (copied)" in url:
-            url = url.replace("  (copied)", "").strip()
-        if url.startswith("http"):
+        if self._url.startswith("http"):
             try:
-                webbrowser.open(url, new=2)
+                webbrowser.open(self._url, new=2)
             except Exception as e:
                 logger.exception("Failed to open browser: %s", e)
-                self.link_var.set(f"Failed to open: {e}")
+                self._set_link(f"Failed to open: {e}")
         return "break"
 
     def _show_menu(self, e: Any) -> None:
-        if self.link_var.get().startswith("http"):
+        if self._url.startswith("http"):
             try:
                 self._context_menu.post(e.x_root, e.y_root)
             except Exception as e:
                 logger.debug("Menu show error: %s", e)
 
     # --- Server control ---
+    def _parse_port(self) -> int:
+        port = int(self.port_var.get())
+        if not (1 <= port <= 65535):
+            raise ValueError("Port must be 1-65535")
+        return port
+
+    def _resolve_monitor(self) -> int:
+        label = self.monitor_label_var.get()
+        idx = config.label_to_idx.get(label)
+        if idx is None:
+            idx = int(label.split(":")[0].strip())
+        return int(idx)
+
+    def _wait_server_ready(self, th: threading.Thread) -> bool:
+        for _ in range(10):
+            time.sleep(0.15)
+            with config.server_lock:
+                if config.server is not None:
+                    return True
+            if not th.is_alive():
+                return False
+        return False
+
     def _start(self) -> None:
         if not config.stop_event.is_set():
             logger.debug("Start ignored - already running")
             return
         # Ensure previous threads fully terminated before starting new ones
-        old_th = config.server_thread
-        if old_th and old_th.is_alive():
-            logger.warning("Previous server thread still alive, waiting 2s")
-            old_th.join(timeout=2.0)
-            if old_th.is_alive():
-                self.link_var.set("Error: previous server still stopping, try again")
-                return
-            config.server_thread = None
-        old_prod = config.producer_thread
-        if old_prod and old_prod.is_alive():
-            logger.warning("Previous producer thread still alive, waiting 2s")
-            old_prod.join(timeout=2.0)
-            if old_prod.is_alive():
-                self.link_var.set("Error: previous capture still stopping, try again")
-                return
-            config.producer_thread = None
+        for name in ("server_thread", "producer_thread"):
+            th = getattr(config, name)
+            if th and th.is_alive():
+                logger.warning("Previous %s still alive, waiting 2s", name)
+                th.join(timeout=2.0)
+                if th.is_alive():
+                    self._set_link(f"Error: previous {name} still stopping, try again")
+                    return
+                setattr(config, name, None)
         try:
-            port = int(self.port_var.get())
-            if not (1 <= port <= 65535):
-                raise ValueError("Port must be 1-65535")
+            port = self._parse_port()
         except ValueError as e:
-            self.link_var.set(f"Invalid port: {e}")
+            self._set_link(f"Invalid port: {e}")
             return
 
         fps = int(self.fps_var.get())
         quality = int(self.quality_var.get())
-        sel_label = self.monitor_label_var.get()
-        monitor_idx = config.label_to_idx.get(sel_label, 0)
         try:
-            if sel_label not in config.label_to_idx:
-                monitor_idx = int(sel_label.split(":")[0].strip())
+            monitor_idx = self._resolve_monitor()
         except Exception as e:
             logger.debug("Monitor idx parse fallback: %s", e)
+            monitor_idx = 0
 
         # Pre-check port synchronously to avoid thread bind race
         try:
             _check_port_available(port)
         except OSError as e:
-            self.link_var.set(f"Port {port} busy: {e}")
+            self._set_link(f"Port {port} busy: {e}")
             return
 
         with config.lock:
@@ -308,27 +326,11 @@ class App(tk.Tk):
 
         cam = None
         try:
-            # BGRA + numpy backend (leanest)
-            try:
-                cam = dxcam.create(output_idx=monitor_idx, output_color="BGRA", processor_backend="numpy")
-            except TypeError:
-                # older dxcam without processor_backend
-                cam = dxcam.create(output_idx=monitor_idx, output_color="BGRA")
-            if cam is None:
-                # fallback to default color if BGRA unsupported
-                cam = dxcam.create(output_idx=monitor_idx)
-            if cam is None:
-                raise RuntimeError(f"Cannot create capture for monitor {monitor_idx} (not found)")
+            cam = create_camera(monitor_idx)
             cam.start(target_fps=fps, video_mode=True)
             with config.lock:
                 config.camera = cam
-            # New stream generation: reset frame buffer so consumers never
-            # replay stale frames from a previous run.
-            with config.frame_cond:
-                config.latest_jpeg = None
-                config.frame_id = 0
-                config.frame_ts = 0.0
-                config.stream_generation += 1
+            config.next_generation()  # reset buffer so consumers never replay stale frames
             config.set_running(True)
             logger.info("Camera started on monitor %d fps=%d", monitor_idx, fps)
 
@@ -343,17 +345,7 @@ class App(tk.Tk):
             th = threading.Thread(target=run_server, args=(port,), daemon=True)
             config.server_thread = th
             th.start()
-            # Wait for server to bind (poll instead of blind 0.7s)
-            server_ready = False
-            for _ in range(10):
-                time.sleep(0.15)
-                with config.server_lock:
-                    srv = config.server
-                if srv is not None:
-                    server_ready = True
-                    break
-                if not th.is_alive():
-                    break
+            server_ready = self._wait_server_ready(th)
             if not th.is_alive():
                 with config.server_lock:
                     srv = config.server
@@ -369,15 +361,14 @@ class App(tk.Tk):
             link = f"{base}/?code={code}" if code else base
             if code:
                 logger.info("Video URL: %s/video?code=%s", base, code)
-            self.link_var.set(link)
+            self._set_link(link, link)
             self.status_label.config(text="RUNNING", foreground="green")
             self.start_btn.config(text="Stop Server", command=self._stop)
             logger.info("Server started on %s:%d", ip, port)
         except Exception as e:
             logger.exception("Failed to start server")
             config.set_running(False)
-            with config.frame_cond:
-                config.frame_cond.notify_all()
+            config.wake_all()
             prod = config.producer_thread
             if prod and prod.is_alive():
                 prod.join(timeout=2.0)
@@ -385,46 +376,9 @@ class App(tk.Tk):
                 config.producer_thread = None
             with config.lock:
                 cur_cam = config.camera
-            if cur_cam is not None:
-                try:
-                    cur_cam.stop()
-                except Exception as ex:
-                    logger.debug("Camera stop error: %s", ex)
-                for _m in ("release", "close"):
-                    if hasattr(cur_cam, _m):
-                        try:
-                            getattr(cur_cam, _m)()
-                        except Exception:
-                            pass
-                        break
-                with config.lock:
-                    config.camera = None
-                try:
-                    del cur_cam
-                except Exception:
-                    pass
+            _release_cam(cur_cam)
             if cam is not None and cam is not cur_cam:
-                try:
-                    cam.stop()
-                except Exception as ex:
-                    logger.debug("Local cam stop error: %s", ex)
-                for _m in ("release", "close"):
-                    if hasattr(cam, _m):
-                        try:
-                            getattr(cam, _m)()
-                        except Exception:
-                            pass
-                        break
-                try:
-                    del cam
-                except Exception:
-                    pass
-            try:
-                import gc
-
-                gc.collect()
-            except Exception:
-                pass
+                _release_cam(cam)
             with config.server_lock:
                 srv = config.server
             if srv is not None and config.HAS_WERKZEUG:
@@ -435,7 +389,7 @@ class App(tk.Tk):
                 with config.server_lock:
                     if config.server is srv:
                         config.server = None
-            self.link_var.set(f"Error: {e}")
+            self._set_link(f"Error: {e}")
             self.status_label.config(text="ERROR", foreground="red")
 
     def _stop(self) -> None:
@@ -443,9 +397,8 @@ class App(tk.Tk):
         config.set_running(False)
         logger.info("Stopping server (was_running=%s)", was_running)
 
-        # Wake producer/consumers first so they exit promptly (stop order: producer -> server -> camera)
-        with config.frame_cond:
-            config.frame_cond.notify_all()
+        # Stop order: producer -> server -> camera (wake blocked threads first)
+        config.wake_all()
         prod = config.producer_thread
         if prod and prod.is_alive():
             prod.join(timeout=2.0)
@@ -454,65 +407,34 @@ class App(tk.Tk):
         if config.producer_thread and not config.producer_thread.is_alive():
             config.producer_thread = None
 
-        # Synchronous shutdown - critical to avoid stale keep-alive sockets causing stutter on restart
+        # Synchronous shutdown - avoids stale keep-alive sockets stuttering on restart
         srv = None
         with config.server_lock:
             srv = config.server
-        if srv is not None and config.HAS_WERKZEUG and was_running:
-            try:
-                srv.shutdown()
-                logger.info("Server shutdown called")
-            except Exception as ex:
-                logger.debug("Server shutdown error: %s", ex)
+        if srv is not None:
+            if config.HAS_WERKZEUG and was_running:
+                try:
+                    srv.shutdown()
+                    logger.info("Server shutdown called")
+                except Exception as ex:
+                    logger.debug("Server shutdown error: %s", ex)
             th = config.server_thread
             if th and th.is_alive():
-                th.join(timeout=2.5)
+                th.join(timeout=2.5 if was_running else 1.0)
                 if th.is_alive():
-                    logger.warning("Server thread did not exit in 2.5s")
+                    logger.warning("Server thread did not exit in time")
             with config.server_lock:
                 if config.server is srv:
                     config.server = None
-        elif srv is not None:
-            with config.server_lock:
-                if config.server is srv:
-                    config.server = None
-            th = config.server_thread
-            if th and th.is_alive():
-                th.join(timeout=1.0)
-        # Clear thread reference if dead
         if config.server_thread and not config.server_thread.is_alive():
             config.server_thread = None
 
         with config.lock:
             cam = config.camera
         if cam is not None:
-            try:
-                cam.stop()
-                logger.info("Camera stopped")
-            except Exception as ex:
-                logger.debug("Camera stop error: %s", ex)
-            # Explicit COM release before clearing ref - prevents AV in __del__ after CoUninitialize
-            for _m in ("release", "close"):
-                if hasattr(cam, _m):
-                    try:
-                        getattr(cam, _m)()
-                    except Exception:
-                        pass
-                    break
-            with config.lock:
-                if config.camera is cam:
-                    config.camera = None
-            try:
-                del cam
-            except Exception:
-                pass
-            try:
-                import gc
-
-                gc.collect()
-            except Exception:
-                pass
-        self.link_var.set("Server stopped")
+            logger.info("Camera stopped")
+        _release_cam(cam)
+        self._set_link("Server stopped")
         self.status_label.config(text="STOPPED", foreground="red")
         self.start_btn.config(text="Start Server", command=self._start)
 

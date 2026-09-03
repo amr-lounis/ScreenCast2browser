@@ -1,6 +1,5 @@
-"""
-monitor.py - Monitor and network discovery (Phase 3: typed & logged)
-"""
+"""Monitor and network discovery."""
+import gc
 import logging
 import socket
 from typing import List, Dict, Any, Tuple
@@ -60,40 +59,11 @@ def get_available_monitors() -> List[Dict[str, Any]]:
                 c = dxcam.create(output_idx=i, output_color="BGRA")
             if c is not None:
                 monitors.append({"idx": i, "label": f"{i}: Monitor {i}", "rect": None, "primary": i == 0})
-            else:
-                continue
         except Exception as e:
             logger.debug("dxcam probe idx %d failed: %s", i, e)
-            continue
         finally:
             if c is not None:
-                try:
-                    if hasattr(c, "stop"):
-                        try:
-                            c.stop()
-                        except Exception as e:
-                            logger.debug("dxcam stop failed idx %d: %s", i, e)
-                    # Explicit release before GC - avoids AV in comtypes __del__ after CoUninitialize
-                    for _meth in ("release", "close"):
-                        if hasattr(c, _meth):
-                            try:
-                                getattr(c, _meth)()
-                            except Exception:
-                                pass
-                            break
-                except Exception as e:
-                    logger.debug("dxcam cleanup failed idx %d: %s", i, e)
-                finally:
-                    try:
-                        del c
-                    except Exception:
-                        pass
-                    try:
-                        import gc
-
-                        gc.collect()
-                    except Exception:
-                        pass
+                _release_probe(c, i)
     if not monitors:
         logger.warning("No monitors detected, using default")
         monitors = [{"idx": 0, "label": "0: Default 1920x1080", "rect": (0, 0, 1920, 1080), "primary": True}]
@@ -102,8 +72,36 @@ def get_available_monitors() -> List[Dict[str, Any]]:
     return monitors
 
 
+def _release_probe(c: Any, idx: int) -> None:
+    """Stop + explicitly release a dxcam probe before GC (avoids comtypes AV)."""
+    try:
+        if hasattr(c, "stop"):
+            try:
+                c.stop()
+            except Exception as e:
+                logger.debug("dxcam stop failed idx %d: %s", idx, e)
+        for meth in ("release", "close"):
+            if hasattr(c, meth):
+                try:
+                    getattr(c, meth)()
+                except Exception:
+                    pass
+                break
+    except Exception as e:
+        logger.debug("dxcam cleanup failed idx %d: %s", idx, e)
+    finally:
+        try:
+            del c
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+
 def get_monitor_offset(idx: int) -> Tuple[int, int]:
-    """Get real offset for monitor idx - dynamic fallback, no hardcoded 1920"""
+    """Real offset for monitor idx - dynamic fallback, no hardcoded 1920."""
     for m in config.available_monitors:
         if m["idx"] == idx and m["rect"]:
             return m["rect"][0], m["rect"][1]
@@ -111,34 +109,31 @@ def get_monitor_offset(idx: int) -> Tuple[int, int]:
         try:
             monitors = win32api.EnumDisplayMonitors(None, None)  # type: ignore
             if 0 <= idx < len(monitors):
-                mon_info = win32api.GetMonitorInfo(monitors[idx][0])  # type: ignore
-                rc = mon_info['Monitor']
+                rc = win32api.GetMonitorInfo(monitors[idx][0])["Monitor"]  # type: ignore
                 return rc[0], rc[1]
         except Exception as e:
             logger.debug("get_monitor_offset live query failed idx %d: %s", idx, e)
-    max_right = None
-    for m in config.available_monitors:
-        rc = m.get("rect")
-        if rc:
-            r = rc[2]
-            if max_right is None or r > max_right:
-                max_right = r
-    if max_right is not None:
-        known_idxs = sorted([m["idx"] for m in config.available_monitors if m.get("rect")])
-        if idx not in known_idxs and max_right is not None:
-            if idx > max(known_idxs, default=-1):
-                return max_right, 0
+    rects = [m["rect"] for m in config.available_monitors if m.get("rect")]
+    if rects:
+        known = sorted(m["idx"] for m in config.available_monitors if m.get("rect"))
+        if idx not in known and idx > max(known, default=-1):
+            return max(rc[2] for rc in rects), 0
     return 0, 0
 
 
-def init_monitors() -> List[Dict[str, Any]]:
-    """Refresh monitor cache at startup"""
-    monitors = get_available_monitors()
+def cache_monitors(monitors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Replace monitor cache + lookup maps (single place, used by GUI too)."""
     config.available_monitors[:] = monitors
     config.label_to_idx.clear()
     config.label_to_idx.update({m["label"]: m["idx"] for m in monitors})
     config.idx_to_label.clear()
     config.idx_to_label.update({m["idx"]: m["label"] for m in monitors})
+    return monitors
+
+
+def init_monitors() -> List[Dict[str, Any]]:
+    """Refresh monitor cache at startup."""
+    monitors = cache_monitors(get_available_monitors())
     if monitors:
         with config.lock:
             config.config["monitor_idx"] = monitors[0]["idx"]

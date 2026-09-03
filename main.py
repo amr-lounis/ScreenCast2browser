@@ -1,7 +1,4 @@
-"""
-web_server.py - Main entry point (Phase 3: logging)
-Keeps backward compatibility (direct execution)
-"""
+"""Main entry point (logging setup + GUI)."""
 import logging
 from gui import create_gui
 

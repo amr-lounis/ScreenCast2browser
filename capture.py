@@ -1,8 +1,4 @@
-"""
-capture.py - Screen capture and frame generation
-Uses simplejpeg (libjpeg-turbo) for fast JPEG, Pillow as fallback, numpy for cursor.
-BGRA is the leanest dxcam path - direct simplejpeg encoding without conversion.
-"""
+"""Screen capture: producer thread (dxcam -> JPEG) + latest-only consumer."""
 import io
 import logging
 import time
@@ -36,122 +32,94 @@ except ImportError:
     Image = None  # type: ignore
 
 
-def _draw_cursor_numpy(frame: np.ndarray, vx: int, vy: int) -> None:
-    """Draw green cross + circle (r=8, thickness=2) directly on frame (BGR/BGRA).
+def _thick_span(c: int, limit: int, half: int = 1) -> tuple:
+    """2px-thick centered span around c within [0, limit), edge-adjusted."""
+    c0 = max(0, c - half)
+    c1 = min(limit, c + half) if limit > 1 else limit
+    if c1 - c0 == 1:
+        if c0 > 0:
+            c0 -= 1
+        elif c1 < limit:
+            c1 += 1
+    return c0, c1
 
-    Modifies frame in-place. Works for both 3-channel BGR/RGB and 4-channel BGRA/RGBA.
-    Color is green (0,255,0) in BGR - same for RGB (0,255,0) is also green.
-    """
+
+def _draw_cursor_numpy(frame: np.ndarray, vx: int, vy: int) -> None:
+    """Draw green cross (20px, thickness 2) + circle ring (r 6..8) in-place."""
     h, w = frame.shape[0], frame.shape[1]
     channels = frame.shape[2] if frame.ndim == 3 else 1
-    # green in BGR and RGB is same (0,255,0)
-    # For BGRA we keep alpha 255
-    if channels == 4:
-        color = np.array([0, 255, 0, 255], dtype=np.uint8)
-    else:
-        color = np.array([0, 255, 0], dtype=np.uint8)
+    color = np.array([0, 255, 0, 255] if channels == 4 else [0, 255, 0], dtype=np.uint8)
 
-    # --- cross: horizontal 20px, vertical 20px, thickness 2 ---
-    # horizontal
-    y0 = max(0, vy - 1)
-    y1 = min(h, vy + 1) if h > 1 else h  # thickness 2: vy-1 to vy+1
-    # adjust to exactly 2px when possible
-    if y1 - y0 == 1 and y0 > 0:
-        y0 -= 1
-    elif y1 - y0 == 1 and y1 < h:
-        y1 += 1
-    x0 = max(0, vx - 10)
-    x1 = min(w, vx + 10)
+    y0, y1 = _thick_span(vy, h)
+    x0, x1 = max(0, vx - 10), min(w, vx + 10)
     if y0 < y1 and x0 < x1:
         frame[y0:y1, x0:x1] = color
 
-    # vertical
-    x0v = max(0, vx - 1)
-    x1v = min(w, vx + 1)
-    if x1v - x0v == 1 and x0v > 0:
-        x0v -= 1
-    elif x1v - x0v == 1 and x1v < w:
-        x1v += 1
-    y0v = max(0, vy - 10)
-    y1v = min(h, vy + 10)
+    x0v, x1v = _thick_span(vx, w)
+    y0v, y1v = max(0, vy - 10), min(h, vy + 10)
     if y0v < y1v and x0v < x1v:
         frame[y0v:y1v, x0v:x1v] = color
 
-    # --- circle ring r=8 thickness 2 (6..8) ---
-    r_outer = 8
-    r_inner = 6
-    x_start = max(0, vx - r_outer - 1)
-    x_end = min(w, vx + r_outer + 2)
-    y_start = max(0, vy - r_outer - 1)
-    y_end = min(h, vy + r_outer + 2)
-    if x_start >= x_end or y_start >= y_end:
+    r_outer, r_inner = 8, 6
+    xs, xe = max(0, vx - r_outer - 1), min(w, vx + r_outer + 2)
+    ys, ye = max(0, vy - r_outer - 1), min(h, vy + r_outer + 2)
+    if xs >= xe or ys >= ye:
         return
-    # vectorized ring mask
-    yy, xx = np.ogrid[y_start - vy : y_end - vy, x_start - vx : x_end - vx]
+    yy, xx = np.ogrid[ys - vy : ye - vy, xs - vx : xe - vx]
     dist2 = xx * xx + yy * yy
     mask = (dist2 <= r_outer * r_outer) & (dist2 >= r_inner * r_inner)
     if np.any(mask):
-        # apply only where mask true
-        region = frame[y_start:y_end, x_start:x_end]
-        # region[mask] works for (h,w,3) -> need broadcasting
-        region[mask] = color
+        frame[ys:ye, xs:xe][mask] = color
+
+
+def create_camera(monitor_idx: int):
+    """Create dxcam capture (BGRA + numpy, leanest). Raises RuntimeError if none."""
+    import dxcam  # local import: keeps capture importable without GPU lib
+
+    for kwargs in (
+        {"output_idx": monitor_idx, "output_color": "BGRA", "processor_backend": "numpy"},
+        {"output_idx": monitor_idx, "output_color": "BGRA"},
+        {"output_idx": monitor_idx},
+    ):
+        try:
+            cam = dxcam.create(**kwargs)  # type: ignore
+        except TypeError:
+            continue  # old dxcam without processor_backend
+        if cam is not None:
+            return cam
+    raise RuntimeError(f"Cannot create capture for monitor {monitor_idx} (not found)")
 
 
 def _encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
     """Encode frame to JPEG bytes. Tries simplejpeg (fast) then Pillow."""
     quality = int(max(10, min(95, quality)))
-    h, w = frame.shape[0], frame.shape[1]
-    # Ensure uint8 contiguous
     if frame.dtype != np.uint8:
         frame = frame.astype(np.uint8)
-    # simplejpeg path - fastest, supports BGRA/BGR directly without copy
+    channels = frame.shape[2] if frame.ndim == 3 else 1
+    # BGRA direct is the leanest dxcam mode (no conversion); 3ch comes from
+    # BGRA so BGR keeps R/B order (if colors ever invert, use "RGB").
     if HAS_SIMPLEJPEG and simplejpeg is not None:
         try:
-            if frame.ndim == 3 and frame.shape[2] == 4:
-                # BGRA direct - no numpy conversion (leanest dxcam mode)
-                # colorsubsampling='420' is smallest/fastest (4:2:0 chroma subsampling)
-                return simplejpeg.encode_jpeg(
-                    frame, quality=quality, colorspace="BGRA", colorsubsampling="420", fastdct=True
-                )
-            elif frame.ndim == 3 and frame.shape[2] == 3:
-                # 3-channel: dxcam default was RGB, but BGRA mode gives 4ch
-                # Treat as BGR (if BGRA sliced) vs RGB (default). Since we request BGRA, this is fallback.
-                # Use BGR (BGRA sliced). If colors inverted, change to "RGB".
-                # We try BGR first; it's zero-copy if frame is already BGR contiguous.
-                # For RGB input, BGR will invert R/B - user can toggle by changing colorspace.
-                return simplejpeg.encode_jpeg(
-                    frame, quality=quality, colorspace="BGR", colorsubsampling="420", fastdct=True
-                )
-            else:
-                # Gray
-                return simplejpeg.encode_jpeg(
-                    frame, quality=quality, colorspace="GRAY", colorsubsampling="Gray", fastdct=True
-                )
+            colorspace = {4: "BGRA", 3: "BGR"}.get(channels, "GRAY")
+            subsampling = "Gray" if colorspace == "GRAY" else "420"
+            return simplejpeg.encode_jpeg(
+                frame, quality=quality, colorspace=colorspace, colorsubsampling=subsampling, fastdct=True
+            )
         except Exception as e:
             logger.debug("simplejpeg encode failed: %s, fallback to Pillow", e)
 
     if HAS_PIL and Image is not None:
-        try:
-            # Pillow expects RGB
-            if frame.ndim == 3 and frame.shape[2] == 4:
-                # BGRA -> RGB: [B,G,R,A] -> [R,G,B] via 2::-1 slice (R,G,B)
-                # frame[:,:,2::-1] gives (R,G,B) with negative stride -> need contiguous copy
-                rgb = np.ascontiguousarray(frame[:, :, 2::-1])
-            elif frame.ndim == 3 and frame.shape[2] == 3:
-                # Assume BGR (from BGRA) -> RGB, so flip. If frame is already RGB, this will invert;
-                # but BGRA path is primary, so flip is correct.
-                # We treat 3ch as BGR (BGRA primary path).
-                rgb = np.ascontiguousarray(frame[:, :, ::-1])
-            else:
-                rgb = frame
-            # Pillow subsampling: 0=444, 1=422, 2=420 (2 is smallest/fastest, matches simplejpeg 420)
-            im = Image.fromarray(rgb)
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=quality, subsampling=2, optimize=False)
-            return buf.getvalue()
-        except Exception as e:
-            logger.debug("Pillow encode failed: %s", e)
-            raise
+        # Pillow expects RGB: BGRA -> RGB via [2::-1], BGR -> RGB via [::-1]
+        if channels == 4:
+            rgb = np.ascontiguousarray(frame[:, :, 2::-1])
+        elif channels == 3:
+            rgb = np.ascontiguousarray(frame[:, :, ::-1])
+        else:
+            rgb = frame
+        im = Image.fromarray(rgb)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=quality, subsampling=2, optimize=False)
+        return buf.getvalue()
 
     raise RuntimeError("No JPEG encoder available (install simplejpeg or Pillow)")
 
@@ -166,31 +134,16 @@ def producer_loop() -> None:
     if not HAS_SIMPLEJPEG and not HAS_PIL:
         logger.error("No encoder available - install simplejpeg or Pillow")
         return
-    # Snapshot config every N frames to reduce lock contention in hot loop
-    show_cur = True
-    quality = 70
-    monitor_idx = 0
-    fps = 30
+    # Snapshot settings every N frames to reduce lock contention in hot loop
+    fps, quality, show_cur, monitor_idx = config.snapshot_settings()
     tick = 0
-    with config.lock:
-        try:
-            show_cur = bool(config.config["show_cursor"])
-            quality = int(config.config["quality"])
-            monitor_idx = int(config.config["monitor_idx"])
-            fps = int(config.config["fps"])
-        except Exception:
-            pass
     while not config.stop_event.is_set():
         frame_start = time.perf_counter()
         if tick % 30 == 0:
-            with config.lock:
-                try:
-                    show_cur = bool(config.config["show_cursor"])
-                    quality = int(config.config["quality"])
-                    monitor_idx = int(config.config["monitor_idx"])
-                    fps = int(config.config["fps"])
-                except Exception as e:
-                    logger.debug("config snapshot failed: %s", e)
+            try:
+                fps, quality, show_cur, monitor_idx = config.snapshot_settings()
+            except Exception as e:
+                logger.debug("config snapshot failed: %s", e)
         tick += 1
         with config.lock:
             cam = config.camera

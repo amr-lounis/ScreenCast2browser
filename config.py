@@ -1,7 +1,4 @@
-"""
-config.py - Shared state and settings (Phase 3: Typed & logged)
-App: ScreenCast 2 browser (ScreenCast->browser)
-"""
+"""Shared state and settings (ScreenCast->browser)."""
 import logging
 import threading
 import secrets
@@ -28,8 +25,6 @@ try:
     def _safe_com_del(self):  # type: ignore
         try:
             return _orig_com_del(self)
-        except OSError:
-            return None
         except Exception:
             return None
 
@@ -115,3 +110,39 @@ def set_running(running: bool) -> None:
 def is_running_check() -> bool:
     """Thread-safe check (prefers stop_event)."""
     return not stop_event.is_set()
+
+
+def snapshot_settings() -> tuple:
+    """Copy of hot-loop settings (fps, quality, show_cursor, monitor_idx)."""
+    with lock:
+        return (
+            int(config["fps"]),
+            int(config["quality"]),
+            bool(config["show_cursor"]),
+            int(config["monitor_idx"]),
+        )
+
+
+def next_generation() -> int:
+    """Reset frame buffer for a new run, return the new generation id."""
+    global latest_jpeg, frame_id, frame_ts, stream_generation
+    with frame_cond:
+        latest_jpeg = None
+        frame_id = 0
+        frame_ts = 0.0
+        stream_generation += 1
+        return stream_generation
+
+
+def wake_all() -> None:
+    """Wake producer/consumers blocked on frame_cond."""
+    with frame_cond:
+        frame_cond.notify_all()
+
+
+def join_thread(th: Optional[threading.Thread], timeout: float) -> bool:
+    """Join if alive; True when no longer alive."""
+    if th and th.is_alive():
+        th.join(timeout=timeout)
+        return not th.is_alive()
+    return True

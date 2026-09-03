@@ -1,11 +1,9 @@
-"""
-server.py - Flask server and streaming (Phase 4: fixed restart stutter)
-"""
+"""Flask server: MJPEG streaming + heartbeat + auth."""
 import logging
 import time
 import secrets
 import socket
-from typing import Any
+from typing import Any, List
 
 from flask import Flask, Response, request, abort, jsonify
 import config
@@ -20,22 +18,21 @@ _RATE_LIMIT_MAX: int = 10
 _RATE_LIMIT_WINDOW: int = 60
 
 
-def _is_rate_limited(ip: str) -> bool:
-    now = time.time()
+def _recent_attempts(ip: str, now: float) -> List[float]:
     with config._rate_limit_lock:
-        lst = config._rate_limit.get(ip, [])
-        lst = [t for t in lst if now - t < _RATE_LIMIT_WINDOW]
+        lst = [t for t in config._rate_limit.get(ip, []) if now - t < _RATE_LIMIT_WINDOW]
         config._rate_limit[ip] = lst
-        return len(lst) >= _RATE_LIMIT_MAX
+        return lst
+
+
+def _is_rate_limited(ip: str) -> bool:
+    return len(_recent_attempts(ip, time.time())) >= _RATE_LIMIT_MAX
 
 
 def _record_failed(ip: str) -> None:
     now = time.time()
-    with config._rate_limit_lock:
-        lst = config._rate_limit.get(ip, [])
-        lst.append(now)
-        lst = [t for t in lst if now - t < _RATE_LIMIT_WINDOW]
-        config._rate_limit[ip] = lst
+    lst = _recent_attempts(ip, now)
+    lst.append(now)
 
 
 def is_authorized(req: Any) -> bool:
@@ -60,13 +57,10 @@ def is_authorized(req: Any) -> bool:
     return ok
 
 
-@app.route('/')
-def index() -> str:
-    # Frozen-frame client: main <img> is never cleared, so on disconnect the
-    # last received frame stays visible (no black flash, no badge).
-    # Reconnects happen silently through a hidden probe image: we only swap
-    # img.src once the new stream actually delivers data (probe onload).
-    return '''<html><head><title>ScreenCast->browser</title><meta name="viewport" content="width=device-width,initial-scale=1">
+# Frozen-frame client: main <img> is never cleared, so on disconnect the last
+# frame stays visible (no black flash, no badge). Reconnects go through a
+# hidden probe image; img.src swaps only once the new stream delivers data.
+INDEX_HTML = '''<html><head><title>ScreenCast->browser</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <style>html,body{margin:0;height:100%;background:#000}img{width:100%;height:100%;object-fit:contain}</style>
 </head>
@@ -129,6 +123,11 @@ window.addEventListener('beforeunload',()=>{ clearInterval(statusTimer); clearTi
 </body></html>'''
 
 
+@app.route('/')
+def index() -> str:
+    return INDEX_HTML
+
+
 @app.route('/ping')
 def ping() -> Any:
     if not is_authorized(request):
@@ -169,18 +168,21 @@ def video() -> Any:
 
 
 def _check_port_available(port: int) -> None:
-    """Pre-check if port is free (without SO_REUSEADDR) to detect busy port reliably."""
+    """Pre-check if port is free (SO_REUSEADDR=0) to detect busy port reliably."""
     if port == 0:
         return
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
         except Exception:
             pass
         s.bind(('0.0.0.0', port))
-    finally:
-        s.close()
+
+
+def _clear_server(srv: Any) -> None:
+    with config.server_lock:
+        if config.server is srv:
+            config.server = None
 
 
 def run_server(port: int) -> None:
@@ -196,9 +198,7 @@ def run_server(port: int) -> None:
                 logger.info("Werkzeug server serving on 0.0.0.0:%d", port)
                 srv.serve_forever()
             finally:
-                with config.server_lock:
-                    if config.server is srv:
-                        config.server = None
+                _clear_server(srv)
                 logger.info("Werkzeug server stopped")
         else:
             with config.server_lock:
@@ -207,8 +207,7 @@ def run_server(port: int) -> None:
                 logger.info("Flask dev server on 0.0.0.0:%d", port)
                 app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
             finally:
-                with config.server_lock:
-                    config.server = None
+                _clear_server(app)
                 logger.info("Flask dev server stopped")
     except OSError as e:
         logger.error("Failed to bind port %d: %s", port, e)
