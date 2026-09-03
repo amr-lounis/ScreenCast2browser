@@ -1,9 +1,10 @@
 """Flask server: MJPEG streaming + heartbeat + auth."""
 import logging
+import threading
 import time
 import secrets
 import socket
-from typing import Any, List
+from typing import Any, Generator, List
 
 from flask import Flask, Response, request, abort, jsonify
 import config
@@ -16,6 +17,34 @@ app = Flask(__name__)
 # Rate-limit: 10 failed attempts per 60s per IP
 _RATE_LIMIT_MAX: int = 10
 _RATE_LIMIT_WINDOW: int = 60
+
+# Max concurrent /video viewers (0 = unlimited)
+MAX_CLIENTS: int = 1
+
+_active_streams: int = 0
+_streams_lock = threading.Lock()
+
+
+def _try_acquire_stream() -> bool:
+    global _active_streams
+    with _streams_lock:
+        if 0 < MAX_CLIENTS <= _active_streams:
+            return False
+        _active_streams += 1
+        return True
+
+
+def _release_stream() -> None:
+    global _active_streams
+    with _streams_lock:
+        _active_streams = max(0, _active_streams - 1)
+
+
+def _counted_generate() -> Generator[bytes, None, None]:
+    try:
+        yield from generate()
+    finally:
+        _release_stream()
 
 
 def _recent_attempts(ip: str, now: float) -> List[float]:
@@ -154,9 +183,12 @@ def status() -> Any:
 def video() -> Any:
     if not is_authorized(request):
         abort(403, description="Invalid access code")
+    if not _try_acquire_stream():
+        logger.info("Rejected /video from %s: max clients (%d) reached", request.remote_addr, MAX_CLIENTS)
+        abort(429, description="Server busy: max clients reached")
     with config.lock:
         gen = int(config.stream_generation)
-    resp = Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    resp = Response(_counted_generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
     resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     resp.headers['Pragma'] = 'no-cache'
     resp.headers['Expires'] = '0'
