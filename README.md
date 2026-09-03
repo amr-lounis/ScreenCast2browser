@@ -17,7 +17,7 @@ Open `http://IP:PORT/?code=1234` (default code `1234`, or click **Gen** for rand
 - **Monitor selection** with live Win32 detection + dxcam fallback, dynamic offset (no hardcoded 1920)
 - **FPS/Quality** slider with perf_counter-based timing (no extra frame copy)
 - **Access code** protection: `secrets.compare_digest`, header `X-Access-Code` support, 10/min rate-limit (429)
-- **Streaming resilience**: abort-previous on reconnect, exponential backoff, `naturalWidth` stall detection, `visibilitychange` resume
+- **Streaming resilience**: producer/consumer (latest-only, drop-late), `/status` heartbeat (`frame_id` + generation), backoff reconnect, `visibilitychange` probe
 - **Thread-safe**: `RLock` + `Event` for camera/server, port busy pre-check via `SO_REUSEADDR=0`
 - **Structured code** (Phase 3): `gui.App` class, `StreamConfig` TypedDict, `logging` instead of silent `except: pass`
 
@@ -36,7 +36,7 @@ Open `http://IP:PORT/?code=1234` (default code `1234`, or click **Gen** for rand
 | **Video transport** | **MJPEG via Flask (simplejpeg turbo + Pillow)** — zero WebRTC/ffmpeg complexity, works everywhere | WebRTC (Electron) | H.264 + ffmpeg + MSE (Fragmented MP4, hardware accel optional) | Proprietary WDDM driver + network/USB | **H.264 / H.265 / AV1** hardware-encoded (NVENC/AMF/QuickSync), RTSP/GameStream protocol, ultra-low latency |
 | **Latency / Quality control** | ✅ **FPS 5–60 + Quality 10–95 sliders**, `perf_counter` pacing, no extra copy | Adaptive quality | Hardware accel but highly variable quality | Low latency + audio | **✅ Best for gaming ~10–20 ms**, bitrate/HDR toggles in Moonlight, needs 5 GHz / Ethernet for 4K |
 | **Security** | **✅ Access code (`secrets.compare_digest`) + `X-Access-Code` header + 10/min rate-limit (429)** | ✅ End-to-end encryption (tweetnacl) | ⚠️ Access code only — **explicitly no encryption** (“only trusted networks”) | ❌ No password / no E2E encryption (plain TCP) | ✅ **PIN pairing (4-digit, 30s) + HTTPS Web UI `:47990`** + auto service |
-| **Resilience** | **✅ Auto-reconnect** — `abort-previous`, exponential backoff, `naturalWidth` stall detection, `visibilitychange` resume, `Connection: close` | Basic reconnect | Manual refresh | Driver-level reconnect | ✅ Auto-discovery + PIN re-pair, 1 viewer at a time |
+| **Resilience** | **✅ Auto-reconnect** — producer/consumer latest-only, `/status` heartbeat, generation-aware, backoff, `Connection: close` | Basic reconnect | Manual refresh | Driver-level reconnect | ✅ Auto-discovery + PIN re-pair, 1 viewer at a time |
 | **Footprint / Setup** | **✅ ~77 MB single EXE**, `pip install` → run | ❌ ~140 MB Electron | ✅ ~20 MB Rust (complex build) | Driver + service install | ⚠️ **Heavy** — Sunshine service + GPU drivers + Moonlight on every device + firewall ports `47984-47990` |
 | **Audio / Touch / Pen / Gamepad** | ❌ Pure display — KVM via OS | Mirror only | **✅ Stylus pressure/tilt + multi-touch** (Linux uinput) | **✅ Touch / pen / keyboard / audio** | **✅ Gamepad + rumble + mouse/kb + audio + HDR** — built for gaming |
 | **Best for** | **Lightweight mirroring / extending to any browser, no limits, no ads** | Easy second screen if you accept CE limits / Pro price | **Linux artists** wanting tablet as graphic tablet | Windows users wanting built-in extend + touch/audio | **Gamers** wanting low-latency game streaming to Deck/TV/phone — **overkill for office docs** |

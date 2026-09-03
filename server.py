@@ -7,7 +7,7 @@ import secrets
 import socket
 from typing import Any
 
-from flask import Flask, Response, request, abort
+from flask import Flask, Response, request, abort, jsonify
 import config
 from capture import generate
 
@@ -74,97 +74,102 @@ const code=new URLSearchParams(location.search).get('code')||'';
 const img=document.getElementById('s');
 const statusEl=document.getElementById('status');
 function vurl(){return '/video'+(code?'?code='+encodeURIComponent(code):'')}
-let lastLoad=Date.now();
+function surl(){return '/status'+(code?'?code='+encodeURIComponent(code):'')}
+let currentGen=-1;
+let lastFrameId=-1;
+let lastAdvance=Date.now();
 let retryDelay=700;
 let reconnectTimer=null;
-let stallTimer=null;
-let framePoll=null;
+let statusTimer=null;
 let connecting=false;
 let abortCtrl=null;
-let lastWidth=0;
 function setStatus(t){ statusEl.textContent=t; statusEl.style.display=t?'block':'none'; }
 function vurlWithCacheBust(){
   const base=vurl();
   return base + (base.includes('?') ? '&' : '?') + 't=' + Date.now() + '&r=' + Math.random().toString(36).slice(2,7);
 }
+function scheduleReconnect(d){
+  clearTimeout(reconnectTimer);
+  reconnectTimer=setTimeout(connect, d);
+}
 function connect(){
   if(connecting) return;
   connecting=true;
-  // reset state - critical for restart case
-  retryDelay=700;
-  lastLoad=Date.now();
   clearTimeout(reconnectTimer); reconnectTimer=null;
   if(abortCtrl) try{abortCtrl.abort();}catch(e){}
   abortCtrl=null;
-  try{ img.src=''; img.removeAttribute('src'); }catch(e){}
-  // force abort previous request in some browsers
-  try{ if(img.decode) {} }catch(e){}
+  // Drop stale keep-alive socket: blank the element before assigning new URL
+  try{ img.src='about:blank'; img.removeAttribute('src'); }catch(e){}
   const u=vurlWithCacheBust();
-  console.log('[connect]',new Date().toLocaleTimeString(),u);
+  console.log('[connect]',new Date().toLocaleTimeString(),u,'gen='+currentGen);
   setStatus('Connecting...');
   setTimeout(()=>{ img.src=u; connecting=false; }, 80);
 }
 img.onload=()=>{
-  lastLoad=Date.now();
-  retryDelay=700;
-  lastWidth=img.naturalWidth;
-  setStatus('');
   console.log('[onload]',new Date().toLocaleTimeString(), 'w='+img.naturalWidth);
+  setStatus('');
 };
 img.onerror=(e)=>{
   console.log('[onerror]',new Date().toLocaleTimeString(),e);
   if(connecting) return;
-  if(abortCtrl) try{abortCtrl.abort();}catch(e){}
-  abortCtrl=new AbortController();
-  fetch(vurl(),{method:'HEAD', cache:'no-store', signal:abortCtrl.signal}).then(r=>{
-    if(r.status===403) setStatus('403 Forbidden - wrong access code');
-    else if(r.status===429) setStatus('429 Too many attempts - wait');
-    else setStatus('Error - retrying in '+Math.round(retryDelay)+'ms');
-  }).catch(err=>{
-    if(err && err.name==='AbortError') return;
-    setStatus('Network error - retrying');
-  });
   const d=retryDelay;
   retryDelay=Math.min(retryDelay*1.6, 8000);
-  clearTimeout(reconnectTimer);
-  reconnectTimer=setTimeout(connect, d);
+  setStatus('Error - retrying in '+Math.round(d)+'ms');
+  scheduleReconnect(d);
 };
+async function checkStatus(){
+  if(document.hidden) return;
+  try{
+    const r=await fetch(surl(),{cache:'no-store'});
+    if(r.status===403){ setStatus('403 Forbidden - wrong access code'); return; }
+    if(r.status===429){ setStatus('429 Too many attempts - wait'); return; }
+    if(!r.ok) throw new Error('http '+r.status);
+    const data=await r.json();
+    const now=Date.now();
+    if(currentGen===-1){
+      currentGen=data.generation; lastFrameId=data.frame_id; lastAdvance=now;
+      retryDelay=700; setStatus('');
+      return;
+    }
+    if(data.generation!==currentGen){
+      console.log('[gen-change]',currentGen,'->',data.generation);
+      currentGen=data.generation; lastFrameId=data.frame_id; lastAdvance=now;
+      retryDelay=700;
+      connect();
+      return;
+    }
+    if(data.frame_id!==lastFrameId){
+      lastFrameId=data.frame_id; lastAdvance=now;
+      retryDelay=700; setStatus('');
+    }else{
+      const idle=now-lastAdvance;
+      if(idle>2500 && !connecting){
+        console.log('[stall] idle='+idle+'ms frame='+data.frame_id+' -> reconnect');
+        setStatus('Stalled - reconnecting...');
+        lastAdvance=now;
+        connect();
+      }
+    }
+  }catch(err){
+    // Server down: backoff probe, do not spam <img> connects
+    console.log('[status-fail]',new Date().toLocaleTimeString(),String(err&&err.message||err));
+    setStatus('Server down - retrying in '+Math.round(retryDelay)+'ms');
+    const d=retryDelay;
+    retryDelay=Math.min(retryDelay*1.6, 8000);
+    scheduleReconnect(d);
+  }
+}
 console.log('[start]',new Date().toLocaleTimeString(),location.href);
 connect();
-// Poll naturalWidth to detect MJPEG frames - onload fires only once for multipart
-framePoll=setInterval(()=>{
-  if(img.naturalWidth && img.naturalWidth!==lastWidth){
-    lastWidth=img.naturalWidth;
-    lastLoad=Date.now();
-    retryDelay=700;
-    setStatus('');
-  }
-}, 500);
-stallTimer=setInterval(()=>{
-  if(document.hidden) return;
-  if(connecting) return;
-  const idle=Date.now()-lastLoad;
-  const noFrame = !img.naturalWidth;
-  if(idle>4000 || (noFrame && idle>2500)){
-    console.log('[stall] idle='+idle+'ms, w='+img.naturalWidth+' -> reconnect');
-    setStatus('Stalled - reconnecting...');
-    connect();
-  }
-},1500);
+statusTimer=setInterval(checkStatus,1000);
 document.addEventListener('visibilitychange',()=>{
   if(!document.hidden){
-    console.log('[visible] resume');
-    // only reconnect if actually stalled, not every visibility change
-    const idle=Date.now()-lastLoad;
-    if(idle>2000 || !img.naturalWidth){
-      lastLoad=Date.now();
-      connect();
-    }
+    console.log('[visible] probe status');
+    checkStatus();
   }
 });
 window.addEventListener('beforeunload',()=>{
-  clearInterval(stallTimer);
-  clearInterval(framePoll);
+  clearInterval(statusTimer);
   clearTimeout(reconnectTimer);
   if(abortCtrl) try{abortCtrl.abort();}catch(e){}
   try{ img.src=''; }catch(e){}
@@ -180,10 +185,27 @@ def ping() -> Any:
     return 'ok', 200
 
 
+@app.route('/status')
+def status() -> Any:
+    """Heartbeat: frame counter + stream generation for stall/restart detection."""
+    if not is_authorized(request):
+        abort(403)
+    with config.lock:
+        fid = int(config.frame_id)
+        gen = int(config.stream_generation)
+        fps = int(config.config.get("fps", 0))
+    running = not config.stop_event.is_set()
+    resp = jsonify({"frame_id": fid, "generation": gen, "fps": fps, "running": running})
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    return resp
+
+
 @app.route('/video')
 def video() -> Any:
     if not is_authorized(request):
         abort(403, description="Invalid access code")
+    with config.lock:
+        gen = int(config.stream_generation)
     resp = Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
     resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     resp.headers['Pragma'] = 'no-cache'
@@ -191,6 +213,7 @@ def video() -> Any:
     # Critical for restart: force close so browser doesn't reuse stale keep-alive socket
     resp.headers['Connection'] = 'close'
     resp.headers['X-Accel-Buffering'] = 'no'
+    resp.headers['X-Stream-Generation'] = str(gen)
     return resp
 
 

@@ -156,46 +156,70 @@ def _encode_jpeg(frame: np.ndarray, quality: int) -> bytes:
     raise RuntimeError("No JPEG encoder available (install simplejpeg or Pillow)")
 
 
-def generate() -> Generator[bytes, None, None]:
-    """Frame generator - runs in Flask thread (simplejpeg + Pillow)"""
-    logger.info("generate started (simplejpeg=%s, PIL=%s)", HAS_SIMPLEJPEG, HAS_PIL)
+def producer_loop() -> None:
+    """Single producer: capture + encode + publish latest JPEG (sole pacer).
+
+    Runs in a dedicated background thread. Decouples capture/encode from
+    network backpressure so a slow client never stalls capture.
+    """
+    logger.info("producer started (simplejpeg=%s, PIL=%s)", HAS_SIMPLEJPEG, HAS_PIL)
     if not HAS_SIMPLEJPEG and not HAS_PIL:
         logger.error("No encoder available - install simplejpeg or Pillow")
         return
+    # Snapshot config every N frames to reduce lock contention in hot loop
+    show_cur = True
+    quality = 70
+    monitor_idx = 0
+    fps = 30
+    tick = 0
+    with config.lock:
+        try:
+            show_cur = bool(config.config["show_cursor"])
+            quality = int(config.config["quality"])
+            monitor_idx = int(config.config["monitor_idx"])
+            fps = int(config.config["fps"])
+        except Exception:
+            pass
     while not config.stop_event.is_set():
         frame_start = time.perf_counter()
+        if tick % 30 == 0:
+            with config.lock:
+                try:
+                    show_cur = bool(config.config["show_cursor"])
+                    quality = int(config.config["quality"])
+                    monitor_idx = int(config.config["monitor_idx"])
+                    fps = int(config.config["fps"])
+                except Exception as e:
+                    logger.debug("config snapshot failed: %s", e)
+        tick += 1
         with config.lock:
             cam = config.camera
         if config.stop_event.is_set():
             break
         try:
-            frame = cam.get_latest_frame() if cam else None  # type: ignore
+            raw = cam.get_latest_frame() if cam else None  # type: ignore
         except Exception as e:
             logger.debug("get_latest_frame failed: %s", e)
-            frame = None
-        if frame is None:
+            raw = None
+        if raw is None:
             if config.stop_event.wait(0.01):
                 break
             continue
-
         try:
-            if frame.ndim != 3 or frame.shape[2] not in (3, 4):
-                logger.debug("unexpected frame shape %s", getattr(frame, "shape", None))
+            if raw.ndim != 3 or raw.shape[2] not in (3, 4):
+                logger.debug("unexpected frame shape %s", getattr(raw, "shape", None))
                 if config.stop_event.wait(0.01):
                     break
                 continue
+            # Copy immediately: dxcam reuses its buffer, drawing/encoding
+            # on the shared buffer causes tearing.
+            frame = raw.copy()
             h, w = frame.shape[0], frame.shape[1]
         except Exception as e:
-            logger.debug("frame shape handling failed: %s", e)
+            logger.debug("frame copy failed: %s", e)
             if config.stop_event.wait(0.01):
                 break
             continue
-
-        with config.lock:
-            show_cur = config.config["show_cursor"]
-            quality = int(config.config["quality"])
-            monitor_idx = config.config["monitor_idx"]
-            fps = int(config.config["fps"])
 
         if show_cur and HAS_WIN32 and win32api is not None:
             try:
@@ -216,6 +240,42 @@ def generate() -> Generator[bytes, None, None]:
                 break
             continue
 
+        with config.frame_cond:
+            config.latest_jpeg = jpeg_bytes
+            config.frame_id += 1
+            config.frame_ts = time.time()
+            config.frame_cond.notify_all()
+
+        if fps > 0:
+            elapsed = time.perf_counter() - frame_start
+            sleep_time = (1.0 / fps) - elapsed
+            if sleep_time > 0:
+                if config.stop_event.wait(sleep_time):
+                    break
+    logger.info("producer stopped")
+
+
+def generate() -> Generator[bytes, None, None]:
+    """Frame consumer - runs in Flask thread, yields latest-only (drops late).
+
+    Waits on frame_cond for a newer frame_id; never re-sends duplicates and
+    never paces itself (producer is the sole pacer), so backpressure from a
+    slow client cannot stall capture.
+    """
+    logger.info("generate subscribed")
+    last_sent = -1
+    with config.frame_cond:
+        last_sent = int(config.frame_id)
+    while not config.stop_event.is_set():
+        with config.frame_cond:
+            while int(config.frame_id) <= last_sent and not config.stop_event.is_set():
+                config.frame_cond.wait(timeout=2.0)
+            if config.stop_event.is_set():
+                break
+            last_sent = int(config.frame_id)
+            jpeg_bytes = config.latest_jpeg
+        if not jpeg_bytes:
+            continue
         try:
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg_bytes + b"\r\n")
         except (GeneratorExit, BrokenPipeError, ConnectionAbortedError, OSError) as e:
@@ -224,11 +284,4 @@ def generate() -> Generator[bytes, None, None]:
         except Exception as e:
             logger.exception("generate yield failed: %s", e)
             break
-
-        if fps > 0:
-            elapsed = time.perf_counter() - frame_start
-            sleep_time = (1.0 / fps) - elapsed
-            if sleep_time > 0:
-                if config.stop_event.wait(sleep_time):
-                    break
     logger.info("generate stopped")

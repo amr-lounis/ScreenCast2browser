@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional
 
 import dxcam
 import config
+from capture import producer_loop
 from monitor import get_available_monitors, get_ip, init_monitors
 from server import run_server, _check_port_available
 
@@ -256,7 +257,7 @@ class App(tk.Tk):
         if not config.stop_event.is_set():
             logger.debug("Start ignored - already running")
             return
-        # Ensure previous thread fully terminated before starting new one
+        # Ensure previous threads fully terminated before starting new ones
         old_th = config.server_thread
         if old_th and old_th.is_alive():
             logger.warning("Previous server thread still alive, waiting 2s")
@@ -265,6 +266,14 @@ class App(tk.Tk):
                 self.link_var.set("Error: previous server still stopping, try again")
                 return
             config.server_thread = None
+        old_prod = config.producer_thread
+        if old_prod and old_prod.is_alive():
+            logger.warning("Previous producer thread still alive, waiting 2s")
+            old_prod.join(timeout=2.0)
+            if old_prod.is_alive():
+                self.link_var.set("Error: previous capture still stopping, try again")
+                return
+            config.producer_thread = None
         try:
             port = int(self.port_var.get())
             if not (1 <= port <= 65535):
@@ -313,8 +322,20 @@ class App(tk.Tk):
             cam.start(target_fps=fps, video_mode=True)
             with config.lock:
                 config.camera = cam
+            # New stream generation: reset frame buffer so consumers never
+            # replay stale frames from a previous run.
+            with config.frame_cond:
+                config.latest_jpeg = None
+                config.frame_id = 0
+                config.frame_ts = 0.0
+                config.stream_generation += 1
             config.set_running(True)
             logger.info("Camera started on monitor %d fps=%d", monitor_idx, fps)
+
+            # Start sole pacer: producer thread (capture + encode)
+            prod_th = threading.Thread(target=producer_loop, daemon=True)
+            config.producer_thread = prod_th
+            prod_th.start()
 
             # Clear stale server reference before starting new thread
             with config.server_lock:
@@ -355,6 +376,13 @@ class App(tk.Tk):
         except Exception as e:
             logger.exception("Failed to start server")
             config.set_running(False)
+            with config.frame_cond:
+                config.frame_cond.notify_all()
+            prod = config.producer_thread
+            if prod and prod.is_alive():
+                prod.join(timeout=2.0)
+            if config.producer_thread and not config.producer_thread.is_alive():
+                config.producer_thread = None
             with config.lock:
                 cur_cam = config.camera
             if cur_cam is not None:
@@ -414,6 +442,17 @@ class App(tk.Tk):
         was_running = not config.stop_event.is_set()
         config.set_running(False)
         logger.info("Stopping server (was_running=%s)", was_running)
+
+        # Wake producer/consumers first so they exit promptly (stop order: producer -> server -> camera)
+        with config.frame_cond:
+            config.frame_cond.notify_all()
+        prod = config.producer_thread
+        if prod and prod.is_alive():
+            prod.join(timeout=2.0)
+            if prod.is_alive():
+                logger.warning("Producer thread did not exit in 2s")
+        if config.producer_thread and not config.producer_thread.is_alive():
+            config.producer_thread = None
 
         # Synchronous shutdown - critical to avoid stale keep-alive sockets causing stutter on restart
         srv = None

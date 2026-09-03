@@ -74,6 +74,15 @@ stop_event = threading.Event()
 stop_event.set()  # not running initially
 server_lock = threading.Lock()
 
+# --- Producer/consumer frame buffer (lightweight anti-stutter) ---
+# Single producer thread encodes; /video consumers yield latest-only (drop late).
+frame_cond = threading.Condition(lock)
+latest_jpeg: Optional[bytes] = None
+frame_id: int = 0
+frame_ts: float = 0.0
+stream_generation: int = 0
+producer_thread: Optional[threading.Thread] = None
+
 # Monitor cache
 available_monitors: List[Dict[str, Any]] = []
 label_to_idx: Dict[str, int] = {}
