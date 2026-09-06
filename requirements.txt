@@ -6,3 +6,4 @@ numpy==2.4.6
 comtypes==1.4.16
 Pillow==12.3.0
 simplejpeg==1.9.0
+windows-capture==2.0.1

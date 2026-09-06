@@ -136,24 +136,40 @@ def producer_loop() -> None:
         return
     # Snapshot settings every N frames to reduce lock contention in hot loop
     fps, quality, show_cur, monitor_idx = config.snapshot_settings()
+    source_mode, _window_hwnd = config.snapshot_source()
     tick = 0
     while not config.stop_event.is_set():
         frame_start = time.perf_counter()
         if tick % 30 == 0:
             try:
                 fps, quality, show_cur, monitor_idx = config.snapshot_settings()
+                source_mode, _window_hwnd = config.snapshot_source()
             except Exception as e:
                 logger.debug("config snapshot failed: %s", e)
         tick += 1
-        with config.lock:
-            cam = config.camera
-        if config.stop_event.is_set():
-            break
-        try:
-            raw = cam.get_latest_frame() if cam else None  # type: ignore
-        except Exception as e:
-            logger.debug("get_latest_frame failed: %s", e)
-            raw = None
+        is_window_mode = (source_mode == "window")
+        if is_window_mode:
+            # Window mode: WGC session owns capture (see window_capture.py).
+            # None -> minimized/closed -> freeze last frame (skip publish).
+            with config.lock:
+                wsession = config.window_session
+            if config.stop_event.is_set():
+                break
+            try:
+                raw = wsession.get_latest_frame() if wsession else None  # type: ignore
+            except Exception as e:
+                logger.debug("window get_latest_frame failed: %s", e)
+                raw = None
+        else:
+            with config.lock:
+                cam = config.camera
+            if config.stop_event.is_set():
+                break
+            try:
+                raw = cam.get_latest_frame() if cam else None  # type: ignore
+            except Exception as e:
+                logger.debug("get_latest_frame failed: %s", e)
+                raw = None
         if raw is None:
             if config.stop_event.wait(0.01):
                 break
@@ -174,7 +190,9 @@ def producer_loop() -> None:
                 break
             continue
 
-        if show_cur and HAS_WIN32 and win32api is not None:
+        # Window mode: WGC draws cursor natively (cursor_capture=True),
+        # screen coords don't map to window frame - skip custom overlay.
+        if show_cur and not is_window_mode and HAS_WIN32 and win32api is not None:
             try:
                 x, y = win32api.GetCursorPos()  # type: ignore
                 off_x, off_y = get_monitor_offset(monitor_idx)

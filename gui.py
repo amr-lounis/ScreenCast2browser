@@ -11,6 +11,8 @@ from typing import List, Dict, Any, Optional
 import config
 from capture import create_camera, producer_loop
 from monitor import cache_monitors, get_available_monitors, get_ip, init_monitors
+from window import cache_windows, get_available_windows, init_windows
+from window_capture import create_window_session, stop_window_session
 from server import run_server, _check_port_available
 
 logger = logging.getLogger(__name__)
@@ -46,13 +48,21 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("ScreenCast->browser")
-        self.geometry("420x580")
+        self.geometry("420x660")
         self.resizable(False, False)
 
         monitors = init_monitors()
         if not monitors:
             monitors = config.available_monitors
         self.monitors: List[Dict[str, Any]] = monitors
+
+        # Window list is best-effort (isolated module, never blocks startup)
+        try:
+            windows = init_windows()
+        except Exception as e:
+            logger.debug("init_windows failed: %s", e)
+            windows = config.available_windows
+        self.windows: List[Dict[str, Any]] = windows
 
         self._init_vars()
         self._create_widgets()
@@ -63,6 +73,10 @@ class App(tk.Tk):
     def _init_vars(self) -> None:
         initial_label = self.monitors[0]["label"] if self.monitors else "0: Default"
         self.monitor_label_var = tk.StringVar(value=initial_label)
+        # Source selection (isolated window feature)
+        self.source_mode_var = tk.StringVar(value=config.config.get("source_mode", "monitor"))
+        initial_win = self.windows[0]["label"] if self.windows else ""
+        self.window_label_var = tk.StringVar(value=initial_win)
         self.fps_var = tk.IntVar(value=config.config["fps"])
         self.quality_var = tk.IntVar(value=config.config["quality"])
         self.port_var = tk.StringVar(value="8080")
@@ -91,6 +105,27 @@ class App(tk.Tk):
         refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
         self.monitor_combo.pack(side=tk.RIGHT, padx=(0, 5))
 
+        # Source selection (monitor vs app-window, isolated feature)
+        row_src = ttk.Frame(main_frame)
+        row_src.pack(fill=tk.X, pady=5)
+        ttk.Label(row_src, text="Source:").pack(side=tk.LEFT)
+        ttk.Radiobutton(row_src, text="Monitor", variable=self.source_mode_var,
+                        value="monitor").pack(side=tk.RIGHT, padx=(0, 2))
+        ttk.Radiobutton(row_src, text="Window", variable=self.source_mode_var,
+                        value="window").pack(side=tk.RIGHT, padx=(0, 8))
+
+        # Window row (WGC app-window capture)
+        row_win = ttk.Frame(main_frame)
+        row_win.pack(fill=tk.X, pady=5)
+        ttk.Label(row_win, text="Window:").pack(side=tk.LEFT)
+        self.window_combo = ttk.Combobox(
+            row_win, textvariable=self.window_label_var,
+            values=[w["label"] for w in self.windows], width=26, state="readonly"
+        )
+        refresh_win_btn = ttk.Button(row_win, text="↻", width=3, command=self._refresh_windows)
+        refresh_win_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        self.window_combo.pack(side=tk.RIGHT, padx=(0, 5))
+
         # FPS row
         row2 = ttk.Frame(main_frame)
         row2.pack(fill=tk.X, pady=5)
@@ -113,6 +148,8 @@ class App(tk.Tk):
 
         self.show_cursor.trace_add("write", self._on_cursor_toggle)
         self.monitor_label_var.trace_add("write", self._on_monitor_change)
+        self.window_label_var.trace_add("write", self._on_window_change)
+        self.source_mode_var.trace_add("write", self._on_source_change)
 
         ttk.Checkbutton(main_frame, text="Show Cursor", variable=self.show_cursor).pack(anchor=tk.W, pady=10)
 
@@ -165,6 +202,7 @@ class App(tk.Tk):
         menu.add_command(label="Copy link", command=self._copy_link)
         self._context_menu = menu
         self.link_label.bind("<Button-3>", self._show_menu)
+        self._update_source_ui()
 
     # --- Callbacks ---
     def _set_link(self, text: str, url: str = "") -> None:
@@ -212,6 +250,70 @@ class App(tk.Tk):
                 config.config["monitor_idx"] = int(idx)
         except Exception as e:
             logger.debug("Monitor change error: %s", e)
+
+    # --- Window source (isolated feature) ---
+    def _refresh_windows(self) -> None:
+        if not config.stop_event.is_set():
+            self._set_link("Stop server before refreshing")
+            return
+        try:
+            new_list = cache_windows(get_available_windows())
+        except Exception as e:
+            logger.exception("Failed to refresh windows: %s", e)
+            self._set_link(f"Error refreshing: {e}")
+            return
+        self.windows = new_list
+        self.window_combo.config(values=[w["label"] for w in new_list])
+        if new_list:
+            self.window_label_var.set(new_list[0]["label"])
+            with config.lock:
+                config.config["window_hwnd"] = int(new_list[0]["hwnd"])
+                config.config["window_title"] = str(new_list[0]["title"])
+        self._set_link(f"Found {len(new_list)} window(s)")
+        logger.info("Refreshed windows: %d found", len(new_list))
+
+    def _on_window_change(self, *args: Any) -> None:
+        try:
+            label = self.window_label_var.get()
+            if not label:
+                return
+            hwnd = config.label_to_hwnd.get(label)
+            if hwnd is None:
+                return
+            with config.lock:
+                config.config["window_hwnd"] = int(hwnd)
+                for w in self.windows:
+                    if int(w["hwnd"]) == int(hwnd):
+                        config.config["window_title"] = str(w["title"])
+                        break
+        except Exception as e:
+            logger.debug("Window change error: %s", e)
+
+    def _on_source_change(self, *args: Any) -> None:
+        try:
+            mode = self.source_mode_var.get()
+            if mode not in ("monitor", "window"):
+                mode = "monitor"
+            with config.lock:
+                config.config["source_mode"] = mode
+            self._update_source_ui()
+        except Exception as e:
+            logger.debug("Source change error: %s", e)
+
+    def _update_source_ui(self) -> None:
+        try:
+            is_win = self.source_mode_var.get() == "window"
+            running = not config.stop_event.is_set()
+            # While running, lock source selection (prevents phantom switch bug)
+            state_combo = "disabled" if running else "readonly"
+            try:
+                self.monitor_combo.config(state="disabled" if (is_win or running) else "readonly")
+                self.window_combo.config(state="readonly" if (is_win and not running) else "disabled")
+            except Exception:
+                pass
+            _ = state_combo
+        except Exception as e:
+            logger.debug("Source UI update error: %s", e)
 
     def _toggle_code(self) -> None:
         hidden = self.access_entry.cget("show") == "*"
@@ -272,6 +374,27 @@ class App(tk.Tk):
             idx = int(label.split(":")[0].strip())
         return int(idx)
 
+    def _resolve_window(self) -> tuple:
+        """Resolve (hwnd, title) from window combo. Raises ValueError if none."""
+        label = self.window_label_var.get().strip()
+        if not label:
+            raise ValueError("No window selected (press ↻ to refresh)")
+        hwnd = config.label_to_hwnd.get(label)
+        if hwnd is None:
+            # Fallback: match by title in cached list
+            for w in self.windows:
+                if w["label"] == label:
+                    hwnd = int(w["hwnd"])
+                    break
+        if hwnd is None or int(hwnd) == 0:
+            raise ValueError("Selected window not found - press ↻ to refresh")
+        title = ""
+        for w in self.windows:
+            if int(w["hwnd"]) == int(hwnd):
+                title = str(w["title"])
+                break
+        return int(hwnd), title
+
     def _wait_server_ready(self, th: threading.Thread) -> bool:
         for _ in range(10):
             time.sleep(0.15)
@@ -304,11 +427,21 @@ class App(tk.Tk):
 
         fps = int(self.fps_var.get())
         quality = int(self.quality_var.get())
+        source_mode = self.source_mode_var.get()
+        if source_mode not in ("monitor", "window"):
+            source_mode = "monitor"
         try:
             monitor_idx = self._resolve_monitor()
         except Exception as e:
             logger.debug("Monitor idx parse fallback: %s", e)
             monitor_idx = 0
+        window_hwnd, window_title = 0, ""
+        if source_mode == "window":
+            try:
+                window_hwnd, window_title = self._resolve_window()
+            except ValueError as e:
+                self._set_link(f"Invalid window: {e}")
+                return
 
         # Pre-check port synchronously to avoid thread bind race
         try:
@@ -323,16 +456,30 @@ class App(tk.Tk):
             config.config["show_cursor"] = bool(self.show_cursor.get())
             config.config["monitor_idx"] = monitor_idx
             config.config["access_code"] = self.access_code_var.get().strip()
+            config.config["source_mode"] = source_mode
+            if source_mode == "window":
+                config.config["window_hwnd"] = window_hwnd
+                config.config["window_title"] = window_title
 
         cam = None
+        wsession = None
         try:
-            cam = create_camera(monitor_idx)
-            cam.start(target_fps=fps, video_mode=True)
-            with config.lock:
-                config.camera = cam
-            config.next_generation()  # reset buffer so consumers never replay stale frames
-            config.set_running(True)
-            logger.info("Camera started on monitor %d fps=%d", monitor_idx, fps)
+            if source_mode == "window":
+                # Window path (isolated): WGC session instead of dxcam camera
+                wsession = create_window_session(window_hwnd, bool(self.show_cursor.get()))
+                wsession.start()
+                config.next_generation()
+                config.set_running(True)
+                logger.info("Window capture started hwnd=%s title=%s fps=%d",
+                            window_hwnd, window_title[:40], fps)
+            else:
+                cam = create_camera(monitor_idx)
+                cam.start(target_fps=fps, video_mode=True)
+                with config.lock:
+                    config.camera = cam
+                config.next_generation()  # reset buffer so consumers never replay stale frames
+                config.set_running(True)
+                logger.info("Camera started on monitor %d fps=%d", monitor_idx, fps)
 
             # Start sole pacer: producer thread (capture + encode)
             prod_th = threading.Thread(target=producer_loop, daemon=True)
@@ -364,6 +511,7 @@ class App(tk.Tk):
             self._set_link(link, link)
             self.status_label.config(text="RUNNING", foreground="green")
             self.start_btn.config(text="Stop Server", command=self._stop)
+            self._update_source_ui()
             logger.info("Server started on %s:%d", ip, port)
         except Exception as e:
             logger.exception("Failed to start server")
@@ -374,6 +522,11 @@ class App(tk.Tk):
                 prod.join(timeout=2.0)
             if config.producer_thread and not config.producer_thread.is_alive():
                 config.producer_thread = None
+            try:
+                if wsession is not None:
+                    stop_window_session(wsession)
+            except Exception as ex:
+                logger.debug("Window session cleanup error: %s", ex)
             with config.lock:
                 cur_cam = config.camera
             _release_cam(cur_cam)
@@ -391,13 +544,17 @@ class App(tk.Tk):
                         config.server = None
             self._set_link(f"Error: {e}")
             self.status_label.config(text="ERROR", foreground="red")
+            try:
+                self._update_source_ui()
+            except Exception:
+                pass
 
     def _stop(self) -> None:
         was_running = not config.stop_event.is_set()
         config.set_running(False)
         logger.info("Stopping server (was_running=%s)", was_running)
 
-        # Stop order: producer -> server -> camera (wake blocked threads first)
+        # Stop order: producer -> server -> camera/window (wake blocked threads first)
         config.wake_all()
         prod = config.producer_thread
         if prod and prod.is_alive():
@@ -434,9 +591,17 @@ class App(tk.Tk):
         if cam is not None:
             logger.info("Camera stopped")
         _release_cam(cam)
+        try:
+            stop_window_session()
+        except Exception as e:
+            logger.debug("Window session stop error: %s", e)
         self._set_link("Server stopped")
         self.status_label.config(text="STOPPED", foreground="red")
         self.start_btn.config(text="Start Server", command=self._start)
+        try:
+            self._update_source_ui()
+        except Exception:
+            pass
 
     def _on_closing(self) -> None:
         logger.info("Window closing")

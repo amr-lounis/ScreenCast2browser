@@ -22,9 +22,11 @@ python -m PyInstaller --noconfirm --clean ^
   --hidden-import win32api ^
   --hidden-import win32gui ^
   --hidden-import win32con ^
+  --hidden-import windows_capture ^
   --collect-all dxcam ^
   --collect-all simplejpeg ^
   --collect-all PIL ^
+  --collect-all windows_capture ^
   main.py
 
 if errorlevel 1 (

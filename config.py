@@ -46,6 +46,9 @@ class StreamConfig(TypedDict):
     show_cursor: bool
     monitor_idx: int
     access_code: str
+    source_mode: str  # "monitor" | "window" (window capture isolated in window*.py)
+    window_hwnd: int
+    window_title: str
 
 
 # Streaming settings (thread-safe snapshot)
@@ -55,6 +58,9 @@ config: StreamConfig = {
     "show_cursor": True,
     "monitor_idx": 0,
     "access_code": "1234",
+    "source_mode": "monitor",
+    "window_hwnd": 0,
+    "window_title": "",
 }
 
 # Global state
@@ -82,6 +88,14 @@ producer_thread: Optional[threading.Thread] = None
 available_monitors: List[Dict[str, Any]] = []
 label_to_idx: Dict[str, int] = {}
 idx_to_label: Dict[int, str] = {}
+
+# Window cache (isolated: populated by window.py, consumed by gui/window_capture)
+available_windows: List[Dict[str, Any]] = []
+label_to_hwnd: Dict[str, int] = {}
+hwnd_to_label: Dict[int, str] = {}
+
+# Active window-capture session handle (set by window_capture.py, cleaned on stop)
+window_session: Any = None
 
 # Rate-limit state for auth (ip -> [timestamps])
 _rate_limit: Dict[str, List[float]] = {}
@@ -120,6 +134,18 @@ def snapshot_settings() -> tuple:
             int(config["quality"]),
             bool(config["show_cursor"]),
             int(config["monitor_idx"]),
+        )
+
+
+def snapshot_source() -> tuple:
+    """Copy of capture-source selection (source_mode, window_hwnd).
+
+    Kept separate from snapshot_settings() so monitor hot-loop is untouched.
+    """
+    with lock:
+        return (
+            str(config.get("source_mode", "monitor")),
+            int(config.get("window_hwnd", 0) or 0),
         )
 
 

@@ -3,12 +3,14 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['dxcam', 'simplejpeg', 'PIL', 'flask', 'werkzeug', 'win32api', 'win32gui', 'win32con']
+hiddenimports = ['dxcam', 'simplejpeg', 'PIL', 'flask', 'werkzeug', 'win32api', 'win32gui', 'win32con', 'windows_capture', 'cv2']
 tmp_ret = collect_all('dxcam')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('simplejpeg')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('PIL')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('windows_capture')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
