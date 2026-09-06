@@ -9,7 +9,7 @@ import webbrowser
 from typing import List, Dict, Any, Optional
 
 import config
-from capture import create_camera, producer_loop
+from monitor_capture import create_camera, producer_loop
 from monitor import cache_monitors, get_available_monitors, get_ip, init_monitors
 from window import cache_windows, get_available_windows, init_windows
 from window_capture import create_window_session, stop_window_session

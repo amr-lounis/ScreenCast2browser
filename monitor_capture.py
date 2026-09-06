@@ -1,4 +1,9 @@
-"""Screen capture: producer thread (dxcam -> JPEG) + latest-only consumer."""
+"""Monitor capture: producer thread (dxcam -> JPEG) + latest-only consumer.
+
+Owns fullscreen DXGI capture plus the shared encode/publish pipeline.
+Window frames arrive via window_capture.WindowCaptureSession (WGC);
+see producer_loop() source branch.
+"""
 import io
 import logging
 import time
@@ -74,7 +79,7 @@ def _draw_cursor_numpy(frame: np.ndarray, vx: int, vy: int) -> None:
 
 def create_camera(monitor_idx: int):
     """Create dxcam capture (BGRA + numpy, leanest). Raises RuntimeError if none."""
-    import dxcam  # local import: keeps capture importable without GPU lib
+    import dxcam  # local import: keeps monitor_capture importable without GPU lib
 
     for kwargs in (
         {"output_idx": monitor_idx, "output_color": "BGRA", "processor_backend": "numpy"},

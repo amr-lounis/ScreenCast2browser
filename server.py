@@ -8,7 +8,7 @@ from typing import Any, Generator, List
 
 from flask import Flask, Response, request, abort, jsonify
 import config
-from capture import generate
+from monitor_capture import generate
 
 logger = logging.getLogger(__name__)
 

@@ -3,11 +3,11 @@
 Primary backend: windows-capture (Rust, WGC) with window_hwnd.
 Fallback point: wincam (HWND) - see create_window_session() docstring.
 
-Design notes (kept isolated from capture.py monitor path):
+Design notes (kept isolated from monitor_capture.py monitor path):
 - Event-based WGC -> latest-only queue (size 1), so producer_loop polls
   without blocking and freezes last frame on minimize/close.
 - Frame buffer from WGC is a zero-copy view: copied immediately in callback.
-- cursor_capture=True lets WGC draw the cursor natively; capture.py must
+- cursor_capture=True lets WGC draw the cursor natively; monitor_capture.py must
   skip its custom green-crosshair overlay in window mode (coords differ).
 - draw_border is left as default (None): forcing False raises on some
   platforms ("Toggling the capture border is not supported").
@@ -141,7 +141,7 @@ class WindowCaptureSession:
 
 
 def create_window_session(hwnd: int, show_cursor: bool = True) -> WindowCaptureSession:
-    """Factory (mirrors capture.create_camera). Raises RuntimeError if unusable."""
+    """Factory (mirrors monitor_capture.create_camera). Raises RuntimeError if unusable."""
     return WindowCaptureSession(hwnd, show_cursor)
 
 

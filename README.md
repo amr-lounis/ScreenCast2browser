@@ -28,7 +28,7 @@ Open `http://IP:PORT/?code=1234` (default code `1234`, or click **Gen** for rand
 
 ## Monitor capture
 
-Stream a full display via DXGI Desktop Duplication (`dxcam`, logic in `monitor.py` + `capture.py`):
+Stream a full display via DXGI Desktop Duplication (`dxcam`, logic in `monitor.py` + `monitor_capture.py`):
 
 1. Set **Source** to **Monitor** (server must be stopped).
 2. Press **↻** next to the Monitor list to refresh, pick the display, then **Start Server**.
@@ -80,7 +80,7 @@ Output: `dist/ScreenCast-browser.exe` (~77MB, PyInstaller 6.22.2, no redundant a
 - `monitor.py` - `get_ip()`, `get_available_monitors()`, `get_monitor_offset()` (dynamic), `init_monitors()`
 - `window.py` - `get_available_windows()`, `cache_windows()`, `is_window_valid/minimized()` (isolated)
 - `window_capture.py` - `WindowCaptureSession` (WGC via windows-capture, latest-only queue)
-- `capture.py` - `generate()` (perf_counter, yield multipart) + window/monitor branch
+- `monitor_capture.py` - fullscreen DXGI capture + shared encode/publish pipeline (`generate()`)
 - `server.py` - Flask `app`, `is_authorized()`, `run_server()`, `MAX_CLIENTS`, `/status` heartbeat
 - `gui.py` - `class App(tk.Tk)` (Phase 3), `create_gui()` factory
 
